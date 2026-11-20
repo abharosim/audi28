@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -127,6 +128,16 @@ setInterval(tick, 2000);
 """
 
 
+class _HTTPServer(ThreadingHTTPServer):
+    """Drop traceback noise when the client goes away mid-request."""
+
+    def handle_error(self, request, client_address) -> None:
+        exc = sys.exc_info()[1]
+        if exc is None or isinstance(exc, (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class WebServer:
     def __init__(
         self,
@@ -141,7 +152,9 @@ class WebServer:
     ) -> None:
         if host != "127.0.0.1":
             raise ValueError("web.host 只能是 127.0.0.1。")
-        self._httpd = ThreadingHTTPServer((host, port), _Handler)
+        self._httpd = _HTTPServer((host, port), _Handler)
+        # Handler threads must not keep the process alive after the port closes.
+        self._httpd.daemon_threads = True
         self._httpd.token = token.strip()  # type: ignore[attr-defined]
         self._httpd.sessions = sessions  # type: ignore[attr-defined]
         self._httpd.approvals = approvals  # type: ignore[attr-defined]
@@ -150,11 +163,30 @@ class WebServer:
         self.port = int(self._httpd.server_address[1])
 
     def serve_forever(self) -> None:
-        self._httpd.serve_forever(poll_interval=0.1)
+        try:
+            self._httpd.serve_forever(poll_interval=0.1)
+        except (OSError, ValueError):
+            # The listening socket was closed to unblock select.
+            return
 
-    def shutdown(self) -> None:
-        self._httpd.shutdown()
-        self._httpd.server_close()
+    def shutdown(self, timeout: float = 2.0) -> None:
+        """Ask the accept loop to stop, then close the listening socket.
+
+        ``HTTPServer.shutdown`` waits with no timeout. Closing the listening
+        socket wakes ``select`` and frees the port even if a handler is still
+        blocked, and this wait gives up after ``timeout`` seconds.
+        """
+
+        httpd = self._httpd
+        httpd._BaseServer__shutdown_request = True
+        self.close_listening_socket()
+        httpd._BaseServer__is_shut_down.wait(timeout=timeout)
+
+    def close_listening_socket(self) -> None:
+        try:
+            self._httpd.socket.close()
+        except OSError:
+            return
 
 
 class _Handler(BaseHTTPRequestHandler):

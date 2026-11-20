@@ -107,6 +107,8 @@ flowchart TB
 
 进程模型与 audi27 相同：`./start.sh` → `audi28 supervise` 拉起少量常驻子进程（核心 loop、inbox、web）。DeepSeek 运行时活在核心 loop 里，不要每个任务重新拉起一次 `dsh`。
 
+supervisor 监视 `data/restart.request`。文件出现后，先干净停下仪表盘和传输循环，记下一条 `supervisor` 事件（`action` 为 `restart`，`reason` 是文件内容，最多 200 字，密钥会打码）。web 和 transport 线程各等一小段时间。没退出的记一条 `error`，监听套接字照样关掉，然后才重新执行。若 `pyproject.toml` 比这次启动时新，就在项目根目录执行 `uv sync`。`[deepseek] enabled = true` 时加上 `--extra deepseek`，不另加 `--extra dev`。找不到 `uv`，或 `uv sync` 退出码不是 0，记一条 `error`，然后仍然重新执行。重新执行的参数是当前解释器加 `-m audi28 --config <配置文件> supervise`。更新代码时写这个文件即可，不用在终端里按 Ctrl+C。进程刚启动时如果文件已经在，删掉它，这次启动不当成新的重启请求。次数放在 `AUDI28_RESTARTS`，原因放在 `AUDI28_RESTART_REASON`，并写进 `data/supervisor.json` 的 `restarts` 和 `last_reason`。
+
 ## 6. 组件
 
 | 组件 | 职责 | Phase 1 |
@@ -456,7 +458,7 @@ webhook 体（audi28 → Audi）：
 - Phase 1 不对写文件、shell、插件安装、git、工作区以外的路径做 auto-approve。
 - 默认权限预设是 `workspace-write`。加载时只接受 `read-only` 和 `workspace-write`，拒绝 `danger-full-access`。工具调用仍要经过审批。workspace 默认是 `~/Code/deepseek-workspace`，写在 `config.toml` 里；加载时把 `~` 展开成绝对路径。没写、或写成相对路径，都是配置错误，不会悄悄改用 `$HOME` 下的另一个目录。
 - 日志和事件做 redact（URL、key）。inbox 不跟随 symlink。
-- DeepSeek 的 `dsh_home` 隔离在项目 `data/` 下。macOS 上用 `sandbox-exec` 套住 `dsh`：默认允许，拒绝家目录的读写，只放开工作区、`dsh_home`，以及读 `.venv` 和运行时文件。项目 `.env` 不给读，密钥走环境变量。SDK 0.2.2rc2 的入口是 `dsh_bin`，audi28 用一个包装脚本去调用 `sandbox-exec`。没有 `sandbox-exec` 时记 WARN 并继续。网络和系统目录（包括 `/tmp`）仍可读，这是残留风险。
+- DeepSeek 的 `dsh_home` 隔离在项目 `data/` 下。macOS 沙箱默认关闭，所有平台都一样：只有 `[deepseek.sandbox] enabled = true` 才用 `sandbox-exec` 套住 `dsh`。打开之后默认允许，拒绝家目录的读写，只放开工作区、`dsh_home`，以及读 `.venv` 和运行时文件。项目 `.env` 不给读，密钥走环境变量。SDK 0.2.2rc2 的入口是 `dsh_bin`，audi28 用一个包装脚本去调用 `sandbox-exec`。没有 `sandbox-exec` 时记 WARN 并继续。`doctor` 在沙箱关闭时打 `INFO`，不打 `WARN`，也不因此非 0 退出。网络和系统目录（包括 `/tmp`）仍可读，这是打开沙箱之后的残留风险。
 - 本机写 API（若仪表盘以后要批准按钮）必须要求 JSON、loopback Host，并拒绝跨站 `Sec-Fetch-Site`（对齐 audi27 的 `/api/confirm`）。
 
 ## 15. 目录布局（实现时）
@@ -499,6 +501,7 @@ webhook 体（audi28 → Audi）：
     outbox/grokbot/{pending,inflight,sent,quarantine}/
     sessions/
     dsh-home/
+    restart.request              # 出现则 supervisor 重新执行自己
     audi28.log
 ```
 
@@ -524,7 +527,7 @@ Phase 1 代码按上面拆模块，但每个 PR 只交能独立验证的一小�
 4. 没有 decision 时不会变成 `rejected`。进程重启后这条审批仍是 pending，仪表盘列得出，启动时会再次通知 Audi。
 5. 重复的 `idempotency_key` 不向用户问第二次。
 
-**PR 6 — `doctor` 与文档抛光。** `audi28 doctor` 对 Python、uv、钉住的 SDK、`dsh`、密钥（只报有没有和长度）、工作区、webhook、仪表盘 token、目录、进程心跳、`/health`、待审批、开放 session 和最近一条 error 打 `PASS` / `WARN` / `FAIL`。有 `FAIL` 就非 0 退出。不打印密钥。`--json` 打同样的结果。没有真实密钥时用 `scripts/mock_deepseek.py` 跑进程内假 DeepSeek。Allow rule 已批准，见第 7 节。
+**PR 6 — `doctor` 与文档抛光。** `audi28 doctor` 对 Python、uv、钉住的 SDK、`dsh`、密钥（只报有没有和长度）、工作区、webhook、仪表盘 token、目录、进程心跳、`/health`、待审批、开放 session 和最近一条 error 打 `PASS` / `INFO` / `WARN` / `FAIL`。沙箱关闭是 `INFO`。有 `FAIL` 就非 0 退出。不打印密钥。`--json` 打同样的结果。没有真实密钥时用 `scripts/mock_deepseek.py` 跑进程内假 DeepSeek。Allow rule 已批准，见第 7 节。
 
 ### 之后的阶段（不在本次实现范围）
 

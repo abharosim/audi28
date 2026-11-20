@@ -2,6 +2,7 @@
 # Start the audi28 supervisor. The dashboard listens on 127.0.0.1:8728
 # unless --config points somewhere else. When [deepseek] enabled = true,
 # install the optional deepseek extra so the real SDK is available.
+# After a code change, touch data/restart.request instead of pressing Ctrl+C.
 set -euo pipefail
 cd "$(dirname "$0")"
 

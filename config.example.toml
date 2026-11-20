@@ -61,11 +61,12 @@ approval_requests = true
 # 可选：max_tokens = 49152
 initialize_timeout_seconds = 30
 
-# macOS 上不写 enabled 时默认 true，其它系统默认 false。
+# 所有平台默认关闭。enabled = true 才套 macOS sandbox-exec。
 # SDK 0.2.2rc2 用 dsh_bin 指定运行时可执行文件，不能加命令前缀。
-# audi28 把 dsh_bin 指到 data/sandbox/dsh-sandboxed，由它 exec sandbox-exec。
-# 没有 sandbox-exec 时只记 WARN，照常启动。密钥从环境变量进运行时，不让它读项目 .env。
+# 启用后 audi28 把 dsh_bin 指到 data/sandbox/dsh-sandboxed，由它 exec sandbox-exec。
+# 没有 sandbox-exec 时记 WARN，照常启动。密钥从环境变量进运行时，不让它读项目 .env。
 [deepseek.sandbox]
+enabled = false
 # extra_read_paths = ["/opt/local/share"]
 
 [approval]

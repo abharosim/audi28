@@ -38,8 +38,8 @@ class Check:
     fix: str
 
     def line(self) -> str:
-        if self.status == "PASS":
-            return f"PASS {self.name}: {self.detail}"
+        if self.status in {"PASS", "INFO"}:
+            return f"{self.status} {self.name}: {self.detail}"
         return f"{self.status} {self.name}: {self.detail} fix: {self.fix}"
 
     def as_dict(self) -> dict[str, str]:
@@ -295,7 +295,12 @@ def _workspace_check(config: Config) -> Check:
 
 def _sandbox_check(config: Config, env: Mapping[str, str]) -> Check:
     if not config.deepseek.sandbox.enabled:
-        return Check("sandbox", "PASS", "沙箱未启用。macOS 上不写这项时默认启用。", "")
+        return Check(
+            "sandbox",
+            "INFO",
+            "沙箱默认关闭。要启用，把 [deepseek.sandbox] enabled 设为 true。",
+            "",
+        )
     binary = sandbox_exec_path()
     profile = config.root / "data" / "sandbox" / "deepseek.sb"
     if binary is None:
