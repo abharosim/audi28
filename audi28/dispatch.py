@@ -30,12 +30,18 @@ class Dispatcher:
         self.workspace = workspace
 
     def handle(self, message: Mapping[str, Any]) -> None:
+        message_id = _message_id(message)
+        if message_id and self._is_done(message_id):
+            return
         kind = message.get("kind")
         if kind == "close_session":
             self._close(message)
-            return
-        if kind != "task":
-            return
+        elif kind == "task":
+            self._dispatch_task(message)
+        if message_id:
+            self._mark_done(message_id)
+
+    def _dispatch_task(self, message: Mapping[str, Any]) -> None:
         task = _task_message(message)
         if task.message_id and self._already_routed(task.message_id):
             return
@@ -64,11 +70,27 @@ class Dispatcher:
         )
         return RouteContext(sessions=snapshots)
 
+    def _is_done(self, message_id: str) -> bool:
+        return self._has_event("inbox_done", message_id)
+
     def _already_routed(self, message_id: str) -> bool:
+        return self._has_event("route", message_id)
+
+    def _has_event(self, event_type: str, message_id: str) -> bool:
         for event in self.events.replay():
-            if event.type == "route" and event.ref == message_id:
+            if event.type == event_type and event.ref == message_id:
                 return True
         return False
+
+    def _mark_done(self, message_id: str) -> None:
+        if self._is_done(message_id):
+            return
+        self.events.append(
+            type="inbox_done",
+            source="dispatch",
+            ref=message_id,
+            data={"message_id": message_id},
+        )
 
     def _open(self, task: TaskMessage, reason: str) -> None:
         record = self.sessions.create(
@@ -94,6 +116,9 @@ class Dispatcher:
             )
             return
         record = self.sessions.touch(session_id, task_id=task.message_id)
+        if record.status in _REJECTED:
+            self._open(task, "指定的 session 在继续时已被关闭，改为新开一个。")
+            return
         self._session_event("continued", record, reason)
         self.backend.run(record.backend_session_id, task.text)
 
@@ -135,6 +160,13 @@ class Dispatcher:
                 "reason": reason,
             },
         )
+
+
+def _message_id(message: Mapping[str, Any]) -> str | None:
+    raw = message.get("message_id")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
 
 
 def _task_message(message: Mapping[str, Any]) -> TaskMessage:

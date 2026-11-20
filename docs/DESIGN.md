@@ -164,7 +164,7 @@ Inbox 根目录是 `data/inbox/audi/`。watcher 只认这里的 `*.json`，不�
 
 - 领到的是 symlink，或大小超过 `[inbox] max_bytes`：立刻移到 `quarantine/`，不读链接目标，也不把超限的正文读进内存。记一条 `error`。
 - JSON 解析失败，或解析结果不是对象，或缺少非空字符串 `kind` / `message_id`：留在 `processing/`，按 `[inbox] parse_retries` 个 tick 再试。用尽后移到 `quarantine/`，记一条 `error`。
-- 合法文件先追加 `inbox_received`（`source` 为 `inbox`，`ref` 为 `message_id`，`data.message` 是原文），文件留在 `processing/`，等 dispatch 写完对应的 `route` 事件再移到 `processed/`。这样在「已经收下、还没路由」之间崩溃，重启还能再交给 dispatch。dispatch 按 `message_id` 幂等：已经有 `route` 的不再路由第二次。同一 `message_id` 的另一份文件，或同一个 `idempotency_key`，不重复记 `inbox_received`。事件里不写绝对路径。
+- 合法文件先追加 `inbox_received`（`source` 为 `inbox`，`ref` 为 `message_id`，`data.message` 是原文），文件留在 `processing/`。dispatch 处理完每一种 `kind`（包括 `task`、`close_session` 和其它）都再写一条 `inbox_done`，`ref` 仍是这个 `message_id`。没有 `inbox_done` 的才算没做完，重启会再交给 dispatch。已经有 `inbox_done` 的不再处理第二次。`task` 如果已经写过 `route` 也不再路由一次。同一 `message_id` 的另一份文件，或同一个 `idempotency_key`，不重复记 `inbox_received`。事件里不写绝对路径。做完后文件进 `processed/`。
 
 出站先落在 `data/outbox/grokbot/pending/`，再 POST。`flush` 持有这个 outbox 的排他锁（线程锁，再加 `fcntl` 的 `.lock`），发送过程中不放开。发送前原子地改名为 `inflight/`，并记下认领它的进程。成功后进入 `sent/`。如果这时文件已经不在了，仍然记 `webhook` 事件，不因为 `rename` 失败把这次成功丢掉。另一个活着的进程认领的 `inflight/` 文件不能被抢走。没有活进程认领的（进程已经退出，或根本没写上认领者）下一次 flush 放回 `pending/` 再发。pending 里解析不了、或没有对象形态 `payload` 的文件进 `quarantine/`，记一条 `error`，不要留在原地永远跳过。URL 和 key 只来自 `AUDI28_GROKBOT_WEBHOOK_URL` 和 `AUDI28_GROKBOT_WEBHOOK_KEY`。它们不进 outbox 文件、事件或日志。缺其中任何一个时不发请求，pending 原样留着。
 
@@ -394,7 +394,7 @@ sequenceDiagram
 
 事件文件：`data/events/YYYY-MM-DD.jsonl`，本地日期，一行一个 JSON。固定字段与 audi27 相同。建议 type（不是白名单，读的时候不要拒绝未知类型）：
 
-`inbox_received`、`route`、`session`、`task`、`approval`、`decision`、`reply`、`error`。
+`inbox_received`、`inbox_done`、`route`、`session`、`task`、`approval`、`decision`、`reply`、`error`。
 
 inbox 文件（Audi → audi28），一个文件一个 JSON，文件名建议 `<uuid>.json`：
 

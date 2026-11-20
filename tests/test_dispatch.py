@@ -193,6 +193,100 @@ def _once(inbox: Inbox) -> list[dict]:
     return chosen
 
 
+def test_close_session_is_not_replayed(tmp_path):
+    events = EventLog(tmp_path / "events")
+    sessions = SessionStore(tmp_path / "sessions")
+    created = sessions.create(
+        title="要关掉",
+        backend="deepseek",
+        backend_session_id="fake-close",
+        workspace="",
+        task_id=None,
+    )
+    inbox = Inbox(tmp_path / "inbox", events, parse_retries=2, max_bytes=1048576)
+    inbox.root.mkdir(parents=True)
+    (inbox.root / "close.json").write_text(
+        json.dumps(
+            {
+                "kind": "close_session",
+                "message_id": "msg-close",
+                "session_id": created.session_id,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    dispatcher = Dispatcher(
+        router=_router(),
+        sessions=sessions,
+        backend=FakeBackend(),
+        events=events,
+        workspace="",
+    )
+
+    def deliver(current: Inbox) -> None:
+        for message in _once(current):
+            dispatcher.handle(message)
+            message_id = message.get("message_id")
+            if isinstance(message_id, str):
+                current.complete(message_id)
+
+    deliver(inbox)
+    restarted = Inbox(inbox.root, events, parse_retries=2, max_bytes=1048576)
+    deliver(restarted)
+
+    closed = [
+        event
+        for event in events.replay()
+        if event.type == "session" and event.data.get("action") == "closed"
+    ]
+    assert len(closed) == 1
+    assert any(event.type == "inbox_done" and event.ref == "msg-close" for event in events.replay())
+    assert restarted.undispatched_messages() == []
+
+
+class _CloseOnTouch(SessionStore):
+    def touch(self, session_id: str, *, task_id: str | None):
+        self.close(session_id)
+        return super().touch(session_id, task_id=task_id)
+
+
+def test_closed_during_touch_opens_a_new_session(tmp_path):
+    events = EventLog(tmp_path / "events")
+    sessions = _CloseOnTouch(tmp_path / "sessions")
+    created = sessions.create(
+        title="会被关掉",
+        backend="deepseek",
+        backend_session_id="fake-old",
+        workspace="",
+        task_id=None,
+    )
+    backend = FakeBackend()
+    dispatcher = Dispatcher(
+        router=_router(),
+        sessions=sessions,
+        backend=backend,
+        events=events,
+        workspace="",
+    )
+    dispatcher.handle(
+        {
+            "kind": "task",
+            "message_id": "msg-race",
+            "session_id": created.session_id,
+            "target": None,
+            "text": "继续改",
+        }
+    )
+
+    assert backend.runs == []
+    assert len(backend.starts) == 1
+    actions = [event.data.get("action") for event in events.replay() if event.type == "session"]
+    assert "continued" not in actions
+    assert "created" in actions
+    assert sessions.get(created.session_id).status == "closed"
+
+
 def test_self_phrase_does_not_call_the_backend(tmp_path):
     dispatcher, events, _sessions, backend = _dispatcher(tmp_path)
     dispatcher.handle(

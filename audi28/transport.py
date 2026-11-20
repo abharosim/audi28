@@ -73,7 +73,7 @@ class Inbox:
         pending: list[dict[str, Any]] = []
         seen: set[str] = set()
         for event in self._events.replay():
-            if event.type == "route" and isinstance(event.ref, str) and event.ref:
+            if event.type == "inbox_done" and isinstance(event.ref, str) and event.ref:
                 routed.add(event.ref)
             elif event.type == "inbox_received" and isinstance(event.ref, str) and event.ref not in seen:
                 message = event.data.get("message") if isinstance(event.data, dict) else None
@@ -490,7 +490,7 @@ def _seen_from_events(
     routed_ids: set[str] = set()
     received: dict[str, str | None] = {}
     for event in events.replay():
-        if event.type == "route" and isinstance(event.ref, str) and event.ref:
+        if event.type == "inbox_done" and isinstance(event.ref, str) and event.ref:
             routed_ids.add(event.ref)
             continue
         if event.type != "inbox_received" or not isinstance(event.ref, str) or not event.ref:
