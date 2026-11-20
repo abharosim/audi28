@@ -24,7 +24,7 @@ audi28 是本机的 agent 会话层和统一审批中心。用户通过 Audi（G
 ## 审批与文案
 
 - 三个工具（DeepSeek、Claude Code、Codex）共用规范化的 `ApprovalRequest` / `ApprovalDecision`。新 adapter 只做映射，不另做一套状态机。
-- Phase 1 不对写文件、shell、装包、git、工作区以外的路径做 auto-approve。超时默认拒绝。
+- Phase 1 不对写文件、shell、装包、git、工作区以外的路径做 auto-approve。pending 的审批和提问一直等到用户回答，不因为超时自动拒绝；重启后仍在，可以再次提醒，仪表盘上看得到。
 - 发给用户的 `spoken_text` 必须带来源，例如「DeepSeek 在问你：…」。口述不要包含路径、URL 或 token。
 
 ## 传输
@@ -35,7 +35,7 @@ audi28 是本机的 agent 会话层和统一审批中心。用户通过 Audi（G
 
 ## 测试与 PR
 
-- 先写验收测试再写实现，尤其是路由规则、session 恢复、审批幂等、超时拒绝、inbox 隔离。
+- 先写验收测试再写实现，尤其是路由规则、session 恢复、审批幂等、pending 跨重启仍在且不自动拒绝、inbox 隔离。
 - 每个 PR 保持可独立合并、可测试。骨架、传输、session、DeepSeek adapter、审批中心不要塞进同一个 PR。
 - 不把真实 API key、真实 webhook URL、真实用户对话提交进仓库。
 - 改动行为时同步更新 `README.md`、`AGENTS.md` 和 `config.example.toml`。

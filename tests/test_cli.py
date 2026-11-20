@@ -1,0 +1,109 @@
+import json
+import os
+import signal
+import socket
+import subprocess
+import time
+import urllib.request
+from pathlib import Path
+
+from audi28.cli import main
+from audi28.events import EventLog
+from tests.conftest import ROOT, write_config
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _wait_health(port: int) -> None:
+    deadline = time.time() + 8
+    url = f"http://127.0.0.1:{port}/health"
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=0.5) as response:
+                body = json.loads(response.read().decode())
+            assert body["ok"] is True
+            return
+        except Exception as exc:  # noqa: BLE001 - retry until the server is up
+            last_error = exc
+            time.sleep(0.05)
+    raise AssertionError(f"start.sh did not serve /health: {last_error}")
+
+
+def test_events_replay_prints_unknown_type(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    path = write_config(tmp_path)
+    log = EventLog(tmp_path / "data" / "events")
+    log.append(type="made-up-type", source="cli", data={"ok": True})
+
+    code = main(["--config", str(path), "events", "replay"])
+
+    assert code == 0
+    assert "made-up-type" in capsys.readouterr().out
+
+
+def test_doctor_command_reports_missing_key(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    path = write_config(tmp_path)
+
+    code = main(["--config", str(path), "doctor"])
+
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+    assert code == 1
+    assert "DEEPSEEK_API_KEY" in text
+    assert "Traceback" not in text
+
+
+def test_gitignore_covers_secrets_data_and_venv():
+    text = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    lines = {line.strip() for line in text.splitlines()}
+    assert ".env" in lines
+    assert "data/" in lines
+    assert ".venv/" in lines or ".venv" in lines
+
+
+def test_ci_workflow_runs_pytest():
+    text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "pytest" in text
+    assert "uv sync" in text
+
+
+def test_start_sh_invokes_supervise():
+    text = (ROOT / "start.sh").read_text(encoding="utf-8")
+    assert "audi28 supervise" in text
+    assert os.access(ROOT / "start.sh", os.X_OK)
+
+
+def test_start_sh_serves_health(tmp_path):
+    port = _free_port()
+    path = write_config(tmp_path, port=port)
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path / "home")
+    env.pop("DEEPSEEK_API_KEY", None)
+    proc = subprocess.Popen(
+        [str(ROOT / "start.sh"), "--config", str(path)],
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        _wait_health(port)
+    finally:
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
+        output = proc.stdout.read() if proc.stdout is not None else ""
+    assert "Traceback" not in output
+    assert Path(ROOT / "start.sh").exists()

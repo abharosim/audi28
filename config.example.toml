@@ -4,6 +4,8 @@
 #   AUDI28_GROKBOT_WEBHOOK_KEY=...
 #   DEEPSEEK_API_KEY=sk-...
 #   # 可选：DEEPSEEK_BASE_URL=https://api.deepseek.com
+# 密钥可以稍后才放。没有 DEEPSEEK_API_KEY 时进程不崩溃；
+# `audi28 doctor` 会说明写进 ~/Code/audi28/.env，或导出到环境变量。
 
 [web]
 host = "127.0.0.1"
@@ -13,6 +15,8 @@ port = 8728
 # 事件写在 data/events/YYYY-MM-DD.jsonl。这里暂时没有可调项，section 先留着。
 
 # Audi 不能访问本机 HTTP。任务和决定写成 data/inbox/audi/*.json。
+# Ruoran 已批准：Audi 可以把 JSON 写入 ~/Code/audi28/data/inbox/audi/（目录不存在可以建）。
+# 其它 Mac 路径仍要单独批准。
 [inbox]
 poll_s = 0.2
 parse_retries = 3
@@ -23,27 +27,26 @@ max_bytes = 1048576          # 超过则隔离，不跟随 symlink
 header_name = "Authorization"
 header_value = "Bearer {key}"
 timeout_s = 10               # POST 超时；仅网络错误重试一次
-# 没有回复文件不算 webhook 超时。Audi 的决定走 inbox，见 [approval] timeout_s。
+# 这是 webhook 的 HTTP 超时，不是审批超时。审批没有超时，见 [approval]。
 
 [route]
-# Phase 1 只用规则。以后 llm = true 时，规则无法判断的再交给本地模型，失败则回退 default。
+# Phase 1 只用规则。以后 llm = true 时，规则无法判断的再交给模型，失败则回退到规则。
 llm = false
 default = "deepseek"         # 已经进入 inbox 的消息；self = 请 Audi 自己回答
-# 规则文件可选，实现时提供 routes.example.toml。
-# rules = "routes.toml"
+# 正文包含其中一条，才开新 session。否则继续最近一个仍开放的 session。
+# 判断写入 route 事件，必须有 reason。规则优先，以后可以换成同一个接口的 LLM。
+new_task_phrases = ["新任务", "开一个新的", "new task"]
 
 [sessions]
-idle_timeout_s = 86400       # 超过此时长无新消息则标为 idle，不自动关闭
-sticky_s = 21600             # 跟进消息没带 session_id 时，仅在此窗口内黏到唯一一个仍开放的 session
-# 若更希望每次都开新 session，实现时可把 sticky_s 设为 0（待 Ruoran 确认）
+idle_timeout_s = 86400       # 超过此时长无新消息则标为 idle，不自动关闭，也不因此开新 session
 
 [deepseek]
 enabled = true
 profile = "sdk"
-# 必须是绝对路径。SDK 不会使用 ~/.dsh。
+# 必须显式给出。SDK 不会使用 ~/.dsh。相对路径相对于项目根目录。
 dsh_home = "data/dsh-home"
-# 默认工作区，必须是绝对路径。不要隐式使用 $HOME。实现前由 Ruoran 确认。
-# workspace = "/Users/rowang/Code/audi28/workspace"
+# 默认工作区。`~` 在加载时展开成绝对路径。相对路径会报错，不会悄悄改用别的 $HOME 目录。
+workspace = "~/Code/deepseek-workspace"
 provider = "deepseek-official"
 model = "deepseek-v4-flash"
 permission_mode = "workspace-write"
@@ -53,8 +56,9 @@ approval_requests = true
 initialize_timeout_seconds = 30
 
 [approval]
-timeout_s = 600              # 与 Claude Code HTTP hook 默认等待一致
-timeout_action = "deny"      # Phase 1：超时拒绝（fail closed）。不要改成 allow。
+# 不自动拒绝。pending 的审批和提问一直等到用户回答。
+# 重启后仍在，会再次提醒，仪表盘上看得到。
+# 不要加 timeout_s 或 timeout_action。
 # 不对写文件、shell、装包、git、工作区以外路径做自动批准。
 
 # 以后：Claude Code 的 PermissionRequest HTTP hook 会 POST 到本机。
