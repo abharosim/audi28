@@ -60,6 +60,8 @@ def test_inbox_task_writes_route_and_session_then_calls_backend(tmp_path):
     assert route.ref == "msg-01"
     assert route.data["reason"]
     assert route.data["session_action"] == "new"
+    session = next(event for event in events.replay() if event.type == "session")
+    assert session.data["reason"] == route.data["reason"]
     assert len(backend.starts) == 1
     assert sessions.list()[0].backend_session_id == backend.starts[0].handle
 
@@ -124,9 +126,71 @@ def test_sessions_cli_lists_and_closes(tmp_path, monkeypatch, capsys):
     assert "fake-cli" in listed
 
     assert main(["--config", str(config), "sessions", "close", created.session_id]) == 0
+    closed = [
+        event
+        for event in EventLog(tmp_path / "data" / "events").replay()
+        if event.type == "session" and event.data.get("action") == "closed"
+    ]
+    assert closed
+    assert closed[0].data.get("reason")
+    assert closed[0].ref == created.session_id
     assert main(["--config", str(config), "sessions", "list"]) == 0
     assert created.session_id not in capsys.readouterr().out
     assert main(["--config", str(config), "sessions", "close", "ses-missing"]) == 1
+
+
+def test_crash_before_dispatch_is_replayed_once(tmp_path):
+    events = EventLog(tmp_path / "events")
+    inbox = Inbox(tmp_path / "inbox", events, parse_retries=2, max_bytes=1048576)
+    inbox.root.mkdir(parents=True)
+    (inbox.root / "one.json").write_text(
+        json.dumps(
+            {
+                "kind": "task",
+                "message_id": "msg-crash",
+                "session_id": None,
+                "text": "新任务：跑测试",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    assert inbox.poll_once()
+    assert list((inbox.root / "processing").glob("*.json"))
+    assert list((inbox.root / "processed").glob("*.json")) == []
+
+    restarted_inbox = Inbox(inbox.root, events, parse_retries=2, max_bytes=1048576)
+    sessions = SessionStore(tmp_path / "sessions")
+    backend = FakeBackend()
+    dispatcher = Dispatcher(
+        router=_router(),
+        sessions=sessions,
+        backend=backend,
+        events=events,
+        workspace="",
+    )
+    messages = _once(restarted_inbox)
+    assert messages and messages[0]["message_id"] == "msg-crash"
+    dispatcher.handle(messages[0])
+    dispatcher.handle(messages[0])
+    restarted_inbox.complete("msg-crash")
+
+    routes = [event for event in events.replay() if event.type == "route" and event.ref == "msg-crash"]
+    assert len(routes) == 1
+    assert len(backend.starts) == 1
+    assert list((inbox.root / "processed").glob("*.json"))
+
+
+def _once(inbox: Inbox) -> list[dict]:
+    chosen: list[dict] = []
+    seen: set[str] = set()
+    for message in inbox.undispatched_messages() + inbox.poll_once():
+        message_id = message.get("message_id")
+        if not isinstance(message_id, str) or message_id in seen:
+            continue
+        seen.add(message_id)
+        chosen.append(message)
+    return chosen
 
 
 def test_self_phrase_does_not_call_the_backend(tmp_path):

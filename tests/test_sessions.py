@@ -1,3 +1,4 @@
+import threading
 from datetime import datetime, timedelta, timezone
 
 from audi28.sessions import SessionNotFound, SessionStore
@@ -47,6 +48,38 @@ def test_close_unknown_session_raises(tmp_path):
         assert "ses-missing" in str(exc)
     else:
         raise AssertionError("expected SessionNotFound")
+
+
+def test_stale_touch_cannot_reopen_or_drop_task_id(tmp_path):
+    for index in range(25):
+        store = SessionStore(tmp_path / f"run-{index}")
+        created = store.create(
+            title="并发",
+            backend="deepseek",
+            backend_session_id="fake",
+            workspace="",
+            task_id="msg-old",
+        )
+        barrier = threading.Barrier(2)
+
+        def close_it() -> None:
+            barrier.wait(timeout=2)
+            store.close(created.session_id)
+
+        def touch_it() -> None:
+            barrier.wait(timeout=2)
+            store.touch(created.session_id, task_id="msg-new")
+
+        threads = [threading.Thread(target=close_it), threading.Thread(target=touch_it)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        final = store.get(created.session_id)
+        assert final is not None
+        assert final.status == "closed"
+        assert final.last_task_id in {"msg-old", "msg-new"}
 
 
 def test_most_recent_continuable_skips_closed(tmp_path):

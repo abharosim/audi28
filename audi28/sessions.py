@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 _CONTINUABLE = {"open", "idle", "running"}
+_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_GUARD = threading.Lock()
 
 
 class SessionNotFound(LookupError):
@@ -75,7 +78,7 @@ class SessionStore:
             workspace=workspace,
             last_task_id=task_id,
         )
-        with self._lock():
+        with self._guard():
             _atomic_json(self._path(record.session_id), record.as_dict())
         return record
 
@@ -101,64 +104,43 @@ class SessionStore:
         return records
 
     def close(self, session_id: str) -> Session:
-        record = self.get(session_id)
-        if record is None:
-            raise SessionNotFound(session_id)
-        closed = Session(
-            session_id=record.session_id,
-            backend=record.backend,
-            backend_session_id=record.backend_session_id,
-            status="closed",
-            title=record.title,
-            created_ts=record.created_ts,
-            updated_ts=self._timestamp(),
-            pending_questions=record.pending_questions,
-            workspace=record.workspace,
-            last_task_id=record.last_task_id,
-        )
-        with self._lock():
+        with self._guard():
+            record = self._read(session_id)
+            if record is None:
+                raise SessionNotFound(session_id)
+            if record.status == "closed":
+                return record
+            closed = _replace(
+                record,
+                status="closed",
+                updated_ts=self._timestamp(),
+            )
             _atomic_json(self._path(session_id), closed.as_dict())
-        return closed
+            return closed
 
     def touch(self, session_id: str, *, task_id: str | None) -> Session:
-        record = self.get(session_id)
-        if record is None:
-            raise SessionNotFound(session_id)
-        updated = Session(
-            session_id=record.session_id,
-            backend=record.backend,
-            backend_session_id=record.backend_session_id,
-            status=record.status,
-            title=record.title,
-            created_ts=record.created_ts,
-            updated_ts=self._timestamp(),
-            pending_questions=record.pending_questions,
-            workspace=record.workspace,
-            last_task_id=task_id if task_id is not None else record.last_task_id,
-        )
-        with self._lock():
+        with self._guard():
+            record = self._read(session_id)
+            if record is None:
+                raise SessionNotFound(session_id)
+            if record.status == "closed":
+                return record
+            updated = _replace(
+                record,
+                updated_ts=self._timestamp(),
+                last_task_id=task_id if task_id is not None else record.last_task_id,
+            )
             _atomic_json(self._path(session_id), updated.as_dict())
-        return updated
+            return updated
 
     def set_handle(self, session_id: str, backend_session_id: str) -> Session:
-        record = self.get(session_id)
-        if record is None:
-            raise SessionNotFound(session_id)
-        updated = Session(
-            session_id=record.session_id,
-            backend=record.backend,
-            backend_session_id=backend_session_id,
-            status=record.status,
-            title=record.title,
-            created_ts=record.created_ts,
-            updated_ts=record.updated_ts,
-            pending_questions=record.pending_questions,
-            workspace=record.workspace,
-            last_task_id=record.last_task_id,
-        )
-        with self._lock():
+        with self._guard():
+            record = self._read(session_id)
+            if record is None:
+                raise SessionNotFound(session_id)
+            updated = _replace(record, backend_session_id=backend_session_id)
             _atomic_json(self._path(session_id), updated.as_dict())
-        return updated
+            return updated
 
     def most_recent_continuable(self) -> Session | None:
         continuable = [record for record in self.list(include_closed=True) if record.status in _CONTINUABLE]
@@ -183,24 +165,53 @@ class SessionStore:
             raise SessionNotFound(session_id)
         return self.directory / f"{session_id}.json"
 
-    def _lock(self):
-        self.directory.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.directory / ".lock", os.O_CREAT | os.O_RDWR, 0o644)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        return _LockedFd(fd)
+    def _read(self, session_id: str) -> Session | None:
+        path = self._path(session_id)
+        if not path.is_file():
+            return None
+        return _session_from_obj(json.loads(path.read_text(encoding="utf-8")))
+
+    def _guard(self):
+        return _SessionGuard(self.directory)
 
 
-class _LockedFd:
-    def __init__(self, fd: int) -> None:
-        self._fd = fd
+def _replace(record: Session, **changes: Any) -> Session:
+    data = record.as_dict()
+    data.update(changes)
+    return _session_from_obj(data)
 
-    def __enter__(self) -> "_LockedFd":
+
+class _SessionGuard:
+    def __init__(self, directory: Path) -> None:
+        self._directory = directory
+        self._thread: threading.Lock | None = None
+        self._fd: int | None = None
+
+    def __enter__(self) -> "_SessionGuard":
+        self._directory.mkdir(parents=True, exist_ok=True)
+        self._thread = _thread_lock(self._directory)
+        self._thread.acquire()
+        self._fd = os.open(self._directory / ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         del exc_type, exc, traceback
-        fcntl.flock(self._fd, fcntl.LOCK_UN)
-        os.close(self._fd)
+        if self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+        if self._thread is not None:
+            self._thread.release()
+
+
+def _thread_lock(directory: Path) -> threading.Lock:
+    key = str(directory.resolve())
+    with _THREAD_GUARD:
+        lock = _THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _THREAD_LOCKS[key] = lock
+        return lock
 
 
 def _title(text: str) -> str:
@@ -233,7 +244,12 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
-        os.write(fd, data)
+        view = data
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError(f"写入 {path.name} 失败")
+            view = view[written:]
         os.fsync(fd)
     finally:
         os.close(fd)

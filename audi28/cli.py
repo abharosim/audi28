@@ -100,10 +100,24 @@ def _sessions_command(config: Config, command: str, session_id: str | None) -> i
         print("要关闭的 session_id 不能空。", file=sys.stderr)
         return 1
     try:
-        store.close(session_id)
+        record = store.close(session_id)
     except SessionNotFound:
         print("没有这个 session。", file=sys.stderr)
         return 1
+    EventLog(config.root / "data" / "events").append(
+        type="session",
+        source="cli",
+        ref=record.session_id,
+        data={
+            "action": "closed",
+            "session_id": record.session_id,
+            "status": record.status,
+            "backend_session_id": record.backend_session_id,
+            "title": record.title,
+            "pending_questions": record.pending_questions,
+            "reason": "命令行关闭",
+        },
+    )
     print("已关闭。")
     return 0
 

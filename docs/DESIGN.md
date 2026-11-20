@@ -164,7 +164,7 @@ Inbox 根目录是 `data/inbox/audi/`。watcher 只认这里的 `*.json`，不�
 
 - 领到的是 symlink，或大小超过 `[inbox] max_bytes`：立刻移到 `quarantine/`，不读链接目标，也不把超限的正文读进内存。记一条 `error`。
 - JSON 解析失败，或解析结果不是对象，或缺少非空字符串 `kind` / `message_id`：留在 `processing/`，按 `[inbox] parse_retries` 个 tick 再试。用尽后移到 `quarantine/`，记一条 `error`。
-- 合法文件：`message_id` 已经有过 `inbox_received` 就不再处理第二次，文件直接进 `processed/`，另记一条 `error` 说明是重复。否则先追加 `inbox_received`（`source` 为 `inbox`，`ref` 为 `message_id`，`data.message` 是原文），再移到 `processed/`。事件里不写绝对路径。文件里若还有 `idempotency_key`，同一个 key 也只处理一次。
+- 合法文件先追加 `inbox_received`（`source` 为 `inbox`，`ref` 为 `message_id`，`data.message` 是原文），文件留在 `processing/`，等 dispatch 写完对应的 `route` 事件再移到 `processed/`。这样在「已经收下、还没路由」之间崩溃，重启还能再交给 dispatch。dispatch 按 `message_id` 幂等：已经有 `route` 的不再路由第二次。同一 `message_id` 的另一份文件，或同一个 `idempotency_key`，不重复记 `inbox_received`。事件里不写绝对路径。
 
 出站先落在 `data/outbox/grokbot/pending/`，再 POST。`flush` 持有这个 outbox 的排他锁（线程锁，再加 `fcntl` 的 `.lock`），发送过程中不放开。发送前原子地改名为 `inflight/`，并记下认领它的进程。成功后进入 `sent/`。如果这时文件已经不在了，仍然记 `webhook` 事件，不因为 `rename` 失败把这次成功丢掉。另一个活着的进程认领的 `inflight/` 文件不能被抢走。没有活进程认领的（进程已经退出，或根本没写上认领者）下一次 flush 放回 `pending/` 再发。pending 里解析不了、或没有对象形态 `payload` 的文件进 `quarantine/`，记一条 `error`，不要留在原地永远跳过。URL 和 key 只来自 `AUDI28_GROKBOT_WEBHOOK_URL` 和 `AUDI28_GROKBOT_WEBHOOK_KEY`。它们不进 outbox 文件、事件或日志。缺其中任何一个时不发请求，pending 原样留着。
 
@@ -177,7 +177,7 @@ supervisor 的传输循环碰到异常时记一条 `error`（不写进密钥和 
 ## 8. Session 模型
 
 - audi28 自己生成 `session_id`（例如 `ses-<uuid>`），不要直接拿 DeepSeek 的 id 当对外 id，方便以后一个会话模型下挂多个 backend。
-- 映射表持久化在 `data/sessions/<session_id>.json`，并写 `session` 事件。重启后以文件为准，事件可重建。
+- 映射表持久化在 `data/sessions/<session_id>.json`，并写 `session` 事件。`session` 事件带上路由决定里的 `reason`。命令行 `sessions close` 也写一条。重启后以文件为准，事件可重建。`close`、`touch`、`set_handle` 在同一把排他锁里读改写（线程锁再加 `fcntl`），避免后写入的旧状态把已关闭的 session 重新打开，或丢掉 `last_task_id`。
 - 每条记录至少包含：`session_id`、`backend`（Phase 1 只有 `deepseek`）、`backend_session_id`（backend 的 session handle）、`workspace`、`status`（`open` / `idle` / `running` / `closed` / `error`）、`created_ts`、`updated_ts`（最后活跃时间）、`pending_questions`（还没回答的提问数，Phase 1 先记着，审批中心以后来改）、`last_task_id`、`title`（可从首条任务截断）。
 - 开新 session 还是继续上一个，由 router 决定，见第 9 节。决定成新 session 之后，调用 `harness.run(..., session_id=backend_session_id)`。把两个 id 都写进发给 Audi 的结果。Audi 可以在后续消息里带回 `session_id`；没带回、也没明确要新任务时，仍然继续最近一个仍开放的 session。
 - 同一 session 的跟进：若 DeepSeek 运行时还在，直接 `session.run(text)`；若进程刚重启，先 `resume_session(backend_session_id)` 再 `run`。`dsh_home` 和 workspace 必须与创建时相同。

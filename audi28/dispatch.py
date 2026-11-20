@@ -37,6 +37,8 @@ class Dispatcher:
         if kind != "task":
             return
         task = _task_message(message)
+        if task.message_id and self._already_routed(task.message_id):
+            return
         decision = self.router.decide(task, self._context())
         self.events.append(
             type="route",
@@ -47,9 +49,9 @@ class Dispatcher:
         if decision.target == "audi_self" or decision.session_action == "none":
             return
         if decision.session_action == "continue" and decision.session_id:
-            self._continue(task, decision.session_id)
+            self._continue(task, decision.session_id, decision.reason)
             return
-        self._open(task)
+        self._open(task, decision.reason)
 
     def _context(self) -> RouteContext:
         snapshots = tuple(
@@ -62,7 +64,13 @@ class Dispatcher:
         )
         return RouteContext(sessions=snapshots)
 
-    def _open(self, task: TaskMessage) -> None:
+    def _already_routed(self, message_id: str) -> bool:
+        for event in self.events.replay():
+            if event.type == "route" and event.ref == message_id:
+                return True
+        return False
+
+    def _open(self, task: TaskMessage, reason: str) -> None:
         record = self.sessions.create(
             title=task.text,
             backend="deepseek",
@@ -70,12 +78,12 @@ class Dispatcher:
             workspace=self.workspace,
             task_id=task.message_id,
         )
-        self._session_event("created", record)
+        self._session_event("created", record, reason)
         handle = self.backend.start(record.session_id, task.text)
         if handle:
             record = self.sessions.set_handle(record.session_id, handle)
 
-    def _continue(self, task: TaskMessage, session_id: str) -> None:
+    def _continue(self, task: TaskMessage, session_id: str, reason: str) -> None:
         record = self.sessions.get(session_id)
         if record is None or record.status in _REJECTED:
             self.events.append(
@@ -86,7 +94,7 @@ class Dispatcher:
             )
             return
         record = self.sessions.touch(session_id, task_id=task.message_id)
-        self._session_event("continued", record)
+        self._session_event("continued", record, reason)
         self.backend.run(record.backend_session_id, task.text)
 
     def _close(self, message: Mapping[str, Any]) -> None:
@@ -110,9 +118,9 @@ class Dispatcher:
                 data={"reason": "session 不存在", "session_id": session_id.strip()},
             )
             return
-        self._session_event("closed", record)
+        self._session_event("closed", record, "关闭 session")
 
-    def _session_event(self, action: str, record: Session) -> None:
+    def _session_event(self, action: str, record: Session, reason: str) -> None:
         self.events.append(
             type="session",
             source="sessions",
@@ -124,6 +132,7 @@ class Dispatcher:
                 "backend_session_id": record.backend_session_id,
                 "title": record.title,
                 "pending_questions": record.pending_questions,
+                "reason": reason,
             },
         )
 
