@@ -6,8 +6,12 @@ import os
 import signal
 import threading
 
+from audi28.backend import UnconnectedBackend
 from audi28.config import Config
+from audi28.dispatch import Dispatcher
 from audi28.events import EventLog
+from audi28.router import RulesRouter
+from audi28.sessions import SessionStore
 from audi28.transport import Inbox, Outbox
 from audi28.web import WebServer
 
@@ -61,14 +65,42 @@ def _transport_loop(config: Config, stop: threading.Event) -> None:
         timeout_s=config.grokbot.timeout_s,
         secrets=(url, key),
     )
+    dispatcher = Dispatcher(
+        router=RulesRouter(
+            default=config.route.default,
+            new_task_phrases=config.route.new_task_phrases,
+            not_new_task_phrases=config.route.not_new_task_phrases,
+            self_phrases=config.route.self_phrases,
+        ),
+        sessions=SessionStore(config.root / "data" / "sessions"),
+        backend=UnconnectedBackend(),
+        events=events,
+        workspace=str(config.deepseek.workspace),
+    )
     while not stop.is_set():
         try:
-            inbox.poll_once()
+            for message in _messages_to_dispatch(inbox):
+                dispatcher.handle(message)
+                message_id = message.get("message_id")
+                if isinstance(message_id, str) and message_id.strip():
+                    inbox.complete(message_id.strip())
             outbox.flush_once()
         except Exception as exc:
             # Keep the dashboard up, but do not hide the failure.
             _record_loop_error(events, exc, secrets=(url, key))
         stop.wait(config.inbox.poll_s)
+
+
+def _messages_to_dispatch(inbox: Inbox) -> list[dict]:
+    chosen: list[dict] = []
+    seen: set[str] = set()
+    for message in inbox.undispatched_messages() + inbox.poll_once():
+        message_id = message.get("message_id")
+        if not isinstance(message_id, str) or not message_id.strip() or message_id in seen:
+            continue
+        seen.add(message_id)
+        chosen.append(message)
+    return chosen
 
 
 def _record_loop_error(events: EventLog, exc: Exception, *, secrets: tuple[str, ...]) -> None:

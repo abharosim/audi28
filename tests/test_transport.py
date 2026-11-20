@@ -152,8 +152,12 @@ def test_valid_task_is_received_and_processed(tmp_path):
     inbox, events = _inbox(tmp_path)
     _write_json(inbox.root, "one.json", _task())
 
-    inbox.poll_once()
+    messages = inbox.poll_once()
 
+    assert len(messages) == 1
+    assert len(list((inbox.root / "processing").glob("*.json"))) == 1
+    assert list((inbox.root / "processed").glob("*.json")) == []
+    inbox.complete("msg-01")
     stored = list((inbox.root / "processed").glob("*.json"))
     assert len(stored) == 1
     assert list((inbox.root).glob("*.json")) == []
@@ -173,6 +177,7 @@ def test_duplicate_message_id_is_not_received_twice(tmp_path):
     _write_json(inbox.root, "two.json", _task())
 
     inbox.poll_once()
+    inbox.complete("msg-01")
 
     assert _types(events).count("inbox_received") == 1
     assert len(list((inbox.root / "processed").glob("*.json"))) == 2
@@ -263,7 +268,7 @@ def test_two_workers_claim_a_file_once(tmp_path):
         thread.join(timeout=3)
 
     assert _types(events).count("inbox_received") == 1
-    assert len(list((root / "processed").glob("*.json"))) == 1
+    assert len(list((root / "processing").glob("*.json"))) == 1
 
 
 def test_webhook_2xx_moves_the_outbox_item_and_hides_the_secret(tmp_path, fake_webhook):

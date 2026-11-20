@@ -32,10 +32,13 @@ timeout_s = 10               # POST 超时。网络错误或超时在同一次 f
 [route]
 # Phase 1 只用规则。以后 llm = true 时，规则无法判断的再交给模型，失败则回退到规则。
 llm = false
-default = "deepseek"         # 已经进入 inbox 的消息；self = 请 Audi 自己回答
-# 正文包含其中一条，才开新 session。否则继续最近一个仍开放的 session。
+default = "deepseek"         # 已经进入 inbox 的消息；audi_self = 请 Audi 自己回答
 # 判断写入 route 事件，必须有 reason。规则优先，以后可以换成同一个接口的 LLM。
-new_task_phrases = ["新任务", "开一个新的", "new task"]
+# 正文明确命中其中一条，才开新 session。消息里的 session_id 优先于这些说法。
+new_task_phrases = ["新任务", "开一个新的", "另外一个任务", "new task"]
+# 这些说法盖住里面的新任务词，避免「不是新任务」被当成新任务。
+not_new_task_phrases = ["不是新任务", "接着上一个"]
+self_phrases = ["你直接回答", "不用 DeepSeek"]
 
 [sessions]
 idle_timeout_s = 86400       # 超过此时长无新消息则标为 idle，不自动关闭，也不因此开新 session

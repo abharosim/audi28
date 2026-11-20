@@ -1,6 +1,6 @@
 # audi28 设计文档
 
-> 状态：2026-11-20 的决定已写入正文。Phase 1 的骨架和传输已在本仓库；router、session 存储、DeepSeek adapter、审批中心尚未实现。
+> 状态：2026-11-20 的决定已写入正文。Phase 1 的骨架、传输、规则路由和 session 存储已在本仓库；DeepSeek adapter、审批中心尚未实现。
 > 日期：2026-11-19 起草（America/New_York），2026-11-20 按 Ruoran 的决定改定。
 > 项目位置：Mac 上 `~/Code/audi28`，与 `~/Code/audi27` 并列。本仓库就是这份实现。
 
@@ -114,7 +114,7 @@ flowchart TB
 | `config` | 加载 `config.toml` + `.env`，未知 section 要报错（audi27 的教训） | 做 |
 | `events` | append-only JSONL，字段与 audi27 一致：`id, ts, type, source, ref, data`。不认识的 type 照样保存 | 做 |
 | `transport` | 看 inbox；向 Grok Bot webhook 发消息；把文件移到 `processed/` 或 `quarantine/` | 做 |
-| `router` | 可插拔接口。规则引擎先做；可选 LLM 以后再加。产出 `deepseek` 或 `self`，以及继续 session 还是新开，并带 `reason`。写入 `route` 事件 | 做（仅规则） |
+| `router` | 可插拔接口。规则引擎先做；可选 LLM 以后再加。产出 `deepseek` 或 `audi_self`，以及继续 session 还是新开，并带 `reason`。写入 `route` 事件 | 做（仅规则） |
 | `sessions` | audi28 `session_id` ↔ backend + backend session id；持久化；list / close / 过期 | 做 |
 | `adapters.deepseek` | 启动/复用 Harness，`run` / `resume_session`，并发排空 `next_request`，挂上 `on_user_question` | 做 |
 | `approval` | 规范化 `ApprovalRequest` / `ApprovalDecision`。pending 一直等到用户回答，不自动拒绝；重启后仍在，可再次提醒；幂等、审计事件 | 做 |
@@ -164,7 +164,7 @@ Inbox 根目录是 `data/inbox/audi/`。watcher 只认这里的 `*.json`，不�
 
 - 领到的是 symlink，或大小超过 `[inbox] max_bytes`：立刻移到 `quarantine/`，不读链接目标，也不把超限的正文读进内存。记一条 `error`。
 - JSON 解析失败，或解析结果不是对象，或缺少非空字符串 `kind` / `message_id`：留在 `processing/`，按 `[inbox] parse_retries` 个 tick 再试。用尽后移到 `quarantine/`，记一条 `error`。
-- 合法文件：`message_id` 已经有过 `inbox_received` 就不再处理第二次，文件直接进 `processed/`，另记一条 `error` 说明是重复。否则先追加 `inbox_received`（`source` 为 `inbox`，`ref` 为 `message_id`，`data.message` 是原文），再移到 `processed/`。事件里不写绝对路径。文件里若还有 `idempotency_key`，同一个 key 也只处理一次。
+- 合法文件先追加 `inbox_received`（`source` 为 `inbox`，`ref` 为 `message_id`，`data.message` 是原文），文件留在 `processing/`。dispatch 处理完每一种 `kind`（包括 `task`、`close_session` 和其它）都再写一条 `inbox_done`，`ref` 仍是这个 `message_id`。没有 `inbox_done` 的才算没做完，重启会再交给 dispatch。已经有 `inbox_done` 的不再处理第二次。`task` 如果已经写过 `route` 也不再路由一次。同一 `message_id` 的另一份文件，或同一个 `idempotency_key`，不重复记 `inbox_received`。事件里不写绝对路径。做完后文件进 `processed/`。
 
 出站先落在 `data/outbox/grokbot/pending/`，再 POST。`flush` 持有这个 outbox 的排他锁（线程锁，再加 `fcntl` 的 `.lock`），发送过程中不放开。发送前原子地改名为 `inflight/`，并记下认领它的进程。成功后进入 `sent/`。如果这时文件已经不在了，仍然记 `webhook` 事件，不因为 `rename` 失败把这次成功丢掉。另一个活着的进程认领的 `inflight/` 文件不能被抢走。没有活进程认领的（进程已经退出，或根本没写上认领者）下一次 flush 放回 `pending/` 再发。pending 里解析不了、或没有对象形态 `payload` 的文件进 `quarantine/`，记一条 `error`，不要留在原地永远跳过。URL 和 key 只来自 `AUDI28_GROKBOT_WEBHOOK_URL` 和 `AUDI28_GROKBOT_WEBHOOK_KEY`。它们不进 outbox 文件、事件或日志。缺其中任何一个时不发请求，pending 原样留着。
 
@@ -177,8 +177,8 @@ supervisor 的传输循环碰到异常时记一条 `error`（不写进密钥和 
 ## 8. Session 模型
 
 - audi28 自己生成 `session_id`（例如 `ses-<uuid>`），不要直接拿 DeepSeek 的 id 当对外 id，方便以后一个会话模型下挂多个 backend。
-- 映射表持久化在 `data/sessions/<session_id>.json`，并写 `session` 事件。重启后以文件为准，事件可重建。
-- 每条记录至少包含：`session_id`、`backend`（Phase 1 只有 `deepseek`）、`backend_session_id`、`workspace`、`status`（`open` / `idle` / `running` / `closed` / `error`）、`created_ts`、`updated_ts`、`last_task_id`、`title`（可从首条任务截断）。
+- 映射表持久化在 `data/sessions/<session_id>.json`，并写 `session` 事件。`session` 事件带上路由决定里的 `reason`。命令行 `sessions close` 也写一条。重启后以文件为准，事件可重建。`close`、`touch`、`set_handle` 在同一把排他锁里读改写（线程锁再加 `fcntl`），避免后写入的旧状态把已关闭的 session 重新打开，或丢掉 `last_task_id`。
+- 每条记录至少包含：`session_id`、`backend`（Phase 1 只有 `deepseek`）、`backend_session_id`（backend 的 session handle）、`workspace`、`status`（`open` / `idle` / `running` / `closed` / `error`）、`created_ts`、`updated_ts`（最后活跃时间）、`pending_questions`（还没回答的提问数，Phase 1 先记着，审批中心以后来改）、`last_task_id`、`title`（可从首条任务截断）。
 - 开新 session 还是继续上一个，由 router 决定，见第 9 节。决定成新 session 之后，调用 `harness.run(..., session_id=backend_session_id)`。把两个 id 都写进发给 Audi 的结果。Audi 可以在后续消息里带回 `session_id`；没带回、也没明确要新任务时，仍然继续最近一个仍开放的 session。
 - 同一 session 的跟进：若 DeepSeek 运行时还在，直接 `session.run(text)`；若进程刚重启，先 `resume_session(backend_session_id)` 再 `run`。`dsh_home` 和 workspace 必须与创建时相同。
 - 多个 session 可以并存。推荐一个长期存活的 `DeepSeekHarness`。官方说明 `run()` 可以重叠且不会互相吃掉结果；Phase 1 仍按 session **串行** 执行（每个 session 一个队列），避免审批和提问交错难理。不同 session 之间可以并行，若实现成本高，MVP 先全局串行也行，在代码里留出队列边界。
@@ -195,7 +195,7 @@ class Router:
         ...
 
 # RouteDecision:
-#   target: "deepseek" | "self"
+#   target: "deepseek" | "audi_self"
 #   session_action: "continue" | "new" | "none"
 #   session_id: str | None
 #   reason: str          # 必填。人能看懂为什么是这个决定
@@ -209,16 +209,15 @@ Phase 1 只用规则，配置在 `config.toml` 的 `[route]`。规则先做。�
 先决定交给谁：
 
 1. 显式：用户或 Audi 指定 backend（`target: deepseek`）——直接采用。
-2. 显式自答：「你直接回答」「不用 DeepSeek」等 → `self`。
-3. 关键词 / 模式：改代码、跑测试、看仓库、写 patch 等 → `deepseek`。
-4. 默认：已经进了 audi28 inbox 的消息，默认 `deepseek`（Audi 的第一层过滤应当已经把闲聊拦下）。仍要写出 `reason`。
+2. 显式自答：「你直接回答」「不用 DeepSeek」等 → `audi_self`。
+3. 默认：已经进了 audi28 inbox 的消息，默认 `deepseek`（Audi 的第一层过滤应当已经把闲聊拦下）。仍要写出 `reason`。改代码、跑测试这类关键词不再单独做一条规则，因为默认已经是 `deepseek`。
 
-`self` 的意思是：**不要**开 DeepSeek session，也不要去继续一个。`session_action` 为 `none`，`session_id` 为 null。audi28 向 Audi webhook 回 `kind: self`，请 Audi 用自己的能力回答。Audi 在第一层也可以根本不写 inbox。两层都做判断，是为了 Audi 误放行时还能拦下来，并留下审计。
+`audi_self` 的意思是：**不要**开 DeepSeek session，也不要去继续一个。`session_action` 为 `none`，`session_id` 为 null。audi28 以后向 Audi webhook 回 `kind: self`，请 Audi 用自己的能力回答。Audi 在第一层也可以根本不写 inbox。两层都做判断，是为了 Audi 误放行时还能拦下来，并留下审计。
 
-`target` 是 `deepseek` 时，再决定 session。默认是**继续**最近一个仍开放的 session。只有用户明确说要新任务时才另开。Phase 1 的规则看任务正文，不靠计时窗口：
+`target` 是 `deepseek` 时，再决定 session。默认是**继续**最近一个仍开放的 session。只有用户明确说要新任务时才另开。没有仍开放的 session 时，只能新开。Phase 1 的规则看任务正文，不靠计时窗口。消息里显式带了 `session_id` 时，这条覆盖新任务说法，继续那个 id：
 
-1. 正文包含 `[route] new_task_phrases` 里的一条（默认 `新任务`、`开一个新的`、`new task`）→ `session_action=new`，`session_id=null`。比较时按子串，忽略首尾空白，只对 ASCII 字母忽略大小写。`reason` 写明命中了哪一条。这句话优先于消息里带来的旧 `session_id`。
-2. 否则，消息带了 `session_id` → `session_action=continue`，就用这个 id，不要改去最近的另一个。`reason` 写明是消息点名的 session。这个 id 已经 `closed` 时也仍然给出 `continue` 和这个 id，并在 `reason` 里写明它已关闭；session 层拒绝这轮输入，不要悄悄另开一个来顶替。
+1. 消息带了非空 `session_id` → `session_action=continue`，就用这个 id。`reason` 写明是消息点名的 session。正文里即使有「新任务」也不另开。这个 id 已经 `closed` 或不存在时，router 仍给出 `continue` 和这个 id；session 层拒绝这轮输入，不要悄悄另开一个来顶替。
+2. 否则，正文明确要新任务。默认说法是 `新任务`、`开一个新的`、`另外一个任务`、`new task`（`[route] new_task_phrases`，可再加）。比较时按子串，忽略首尾空白，只对 ASCII 字母忽略大小写。`reason` 写明命中了哪一条。否定说法盖住里面的新任务词：`不是新任务` 不算新任务，`接着上一个` 也不算。这些写在 `[route] not_new_task_phrases`。一个新任务词的整段落在某条否定说法里，就不当成命中。
 3. 否则，继续最近更新的仍开放 session（`open` / `idle` / `running`，按 `updated_ts`）。`closed` 和 `error` 不在此列。有好几个时用最近的那个，不要求恰好只有一个。`reason` 写明「没有新任务说法，继续最近一个仍开放的 session」。
 4. 一个可继续的 session 都没有 → `session_action=new`。`reason` 写明是因为没有仍开放的 session，而不是因为用户要求新任务。
 
@@ -395,7 +394,7 @@ sequenceDiagram
 
 事件文件：`data/events/YYYY-MM-DD.jsonl`，本地日期，一行一个 JSON。固定字段与 audi27 相同。建议 type（不是白名单，读的时候不要拒绝未知类型）：
 
-`inbox_received`、`route`、`session`、`task`、`approval`、`decision`、`reply`、`error`。
+`inbox_received`、`inbox_done`、`route`、`session`、`task`、`approval`、`decision`、`reply`、`error`。
 
 inbox 文件（Audi → audi28），一个文件一个 JSON，文件名建议 `<uuid>.json`：
 
@@ -507,7 +506,7 @@ Phase 1 代码按上面拆模块，但每个 PR 只交能独立验证的一小�
 
 **PR 2 — 传输。** 行为见第 7 节「传输行为」：inbox 原子领取、按 `message_id` 幂等、坏文件隔离、webhook outbox（短退避、重启后续发）、每次收发都写事件。`audi28 grokbot test`。验收：向临时目录写入合法 `task` 文件会得到 `inbox_received` 事件并移到 `processed/`；坏 JSON 在重试后进入 `quarantine/`；symlink 和超大文件被隔离；用本地 HTTP server 测 webhook：2xx 成功，非 2xx 和超时记 `error` 且日志无密钥。CI 不访问真实 webhook。
 
-**PR 3 — Router 与 session 存储。** 第 9 节的规则路由 + `data/sessions` 的 CRUD、list、close。验收：fixtures 覆盖显式 `self`、显式 `deepseek`、默认 `deepseek`；正文含「新任务」时 `session_action=new` 并写下 reason；否则继续最近一个仍开放的 session；没有可继续的 session 时才新开，reason 说明原因；重启后 session 文件仍在；关闭后的 id 拒绝新 task；`route` 事件带 reason，并能用 `ref` 串回 inbox 消息。
+**PR 3 — Router 与 session 存储。** 第 9 节的规则路由 + `data/sessions` 的 list、close、重启后仍在。验收：显式 `audi_self`、显式 `deepseek`、默认 `deepseek`；「新任务」「开一个新的」「另外一个任务」「new task」才 `session_action=new`；「不是新任务」和「接着上一个」继续上一个；消息里的 `session_id` 覆盖新任务说法；没有可继续的 session 时才新开，reason 说明原因；关闭后的 id 拒绝新 task；inbox 的一条 task 写出 `route` 和 `session` 事件，再交给 Backend。DeepSeek adapter 不在这一步，测试用 fake backend。
 
 **PR 4 — DeepSeek adapter。** 加上 `deepseek-harness-sdk` 依赖（建议 optional extra `deepseek`，避免没装密钥的 CI 强行拉运行时，或在 CI 里 mock 子进程）。实现启动、`run`、`resume_session`、并发的 `next_request` 循环、`on_user_question`。验收：用 fake/stub 运行时（或录制的 JSON-RPC）证明 prompt 被发送、`final_response` 变成 `reply` 事件、resume 走 `session/resume` 而不是新 id；缺失的 session id 按官方行为报错，不静默另建。
 

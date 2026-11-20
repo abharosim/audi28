@@ -45,24 +45,64 @@ class Inbox:
         self._parse_retries = parse_retries
         self._max_bytes = max_bytes
         self._secrets = tuple(secret for secret in secrets if secret)
-        self._seen_ids, self._seen_keys = _seen_from_events(events)
+        self._routed_ids: set[str] = set()
+        self._received_ids: set[str] = set()
+        self._routed_keys: set[str] = set()
+        self._received_keys: set[str] = set()
+        self._yielded: set[str] = set()
+        self._refresh_seen()
 
-    def poll_once(self) -> None:
+    def poll_once(self) -> list[dict[str, Any]]:
+        accepted: list[dict[str, Any]] = []
         self._ensure_dirs()
         with _thread_lock(self.root), self._decision_lock():
             self._refresh_seen()
+            self._yielded = set()
             leftovers = _json_files(self.processing)
             incoming = _json_files(self.root)
             for path in leftovers:
-                self._accept_one(path)
+                self._accept_one(path, accepted)
             for path in incoming:
-                self._accept_one(path)
+                self._accept_one(path, accepted)
+        return accepted
+
+    def undispatched_messages(self) -> list[dict[str, Any]]:
+        """Inbox messages recorded but not yet routed. Used after a crash."""
+
+        routed: set[str] = set()
+        pending: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for event in self._events.replay():
+            if event.type == "inbox_done" and isinstance(event.ref, str) and event.ref:
+                routed.add(event.ref)
+            elif event.type == "inbox_received" and isinstance(event.ref, str) and event.ref not in seen:
+                message = event.data.get("message") if isinstance(event.data, dict) else None
+                if isinstance(message, dict):
+                    pending.append(message)
+                    seen.add(event.ref)
+        return [
+            message
+            for message in pending
+            if str(message.get("message_id") or "").strip() not in routed
+        ]
+
+    def complete(self, message_id: str) -> None:
+        """Move a dispatched message from processing/ to processed/."""
+
+        message_id = message_id.strip()
+        if not message_id:
+            return
+        self._ensure_dirs()
+        with _thread_lock(self.root), self._decision_lock():
+            for path in _json_files(self.processing):
+                if _message_id_of(path) == message_id:
+                    self._move(path, self.processed)
 
     def _ensure_dirs(self) -> None:
         for directory in (self.root, self.processing, self.processed, self.quarantine):
             directory.mkdir(parents=True, exist_ok=True)
 
-    def _accept_one(self, path: Path) -> None:
+    def _accept_one(self, path: Path, accepted: list[dict[str, Any]]) -> None:
         claimed = self._claim(path)
         if claimed is None:
             return
@@ -76,7 +116,7 @@ class Inbox:
         if size > self._max_bytes:
             self._quarantine(claimed, "too-large")
             return
-        self._finish_one(claimed)
+        self._finish_one(claimed, accepted)
 
     def _claim(self, path: Path) -> Path | None:
         destination = self.processing / f"{uuid.uuid4().hex}-{path.name}"
@@ -92,7 +132,7 @@ class Inbox:
                 pass
         return destination
 
-    def _finish_one(self, path: Path) -> None:
+    def _finish_one(self, path: Path, accepted: list[dict[str, Any]]) -> None:
         try:
             obj = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError, FileNotFoundError):
@@ -112,9 +152,20 @@ class Inbox:
             idempotency_key = idempotency_key.strip() or None
         else:
             idempotency_key = None
-        if message_id in self._seen_ids or (
-            idempotency_key is not None and idempotency_key in self._seen_keys
+        if message_id in self._routed_ids or (
+            idempotency_key is not None and idempotency_key in self._routed_keys
         ):
+            self._move(path, self.processed)
+            if message_id not in self._routed_ids:
+                self._error("duplicate message_id", ref=message_id)
+            return
+        if message_id in self._received_ids or (
+            idempotency_key is not None and idempotency_key in self._received_keys
+        ):
+            if message_id in self._received_ids and message_id not in self._yielded:
+                self._yielded.add(message_id)
+                accepted.append(obj)
+                return
             self._move(path, self.processed)
             self._error("duplicate message_id", ref=message_id)
             return
@@ -124,10 +175,11 @@ class Inbox:
             ref=message_id,
             data={"message": _redact_value(obj, self._secrets)},
         )
-        self._seen_ids.add(message_id)
+        self._received_ids.add(message_id)
         if idempotency_key is not None:
-            self._seen_keys.add(idempotency_key)
-        self._move(path, self.processed)
+            self._received_keys.add(idempotency_key)
+        self._yielded.add(message_id)
+        accepted.append(obj)
 
     def _fail_parse(self, path: Path) -> None:
         attempts = _read_attempts(path) + 1
@@ -154,9 +206,11 @@ class Inbox:
             attempts.unlink()
 
     def _refresh_seen(self) -> None:
-        ids, keys = _seen_from_events(self._events)
-        self._seen_ids.update(ids)
-        self._seen_keys.update(keys)
+        routed_ids, received_ids, routed_keys, received_keys = _seen_from_events(self._events)
+        self._routed_ids.update(routed_ids)
+        self._received_ids.update(received_ids)
+        self._routed_keys.update(routed_keys)
+        self._received_keys.update(received_keys)
 
     def _decision_lock(self):
         return _exclusive_lock(self.root)
@@ -430,21 +484,40 @@ class _LockedFd:
         os.close(self._fd)
 
 
-def _seen_from_events(events: EventLog) -> tuple[set[str], set[str]]:
-    ids: set[str] = set()
-    keys: set[str] = set()
+def _seen_from_events(
+    events: EventLog,
+) -> tuple[set[str], set[str], set[str], set[str]]:
+    routed_ids: set[str] = set()
+    received: dict[str, str | None] = {}
     for event in events.replay():
-        if event.type != "inbox_received":
+        if event.type == "inbox_done" and isinstance(event.ref, str) and event.ref:
+            routed_ids.add(event.ref)
             continue
-        if isinstance(event.ref, str) and event.ref:
-            ids.add(event.ref)
+        if event.type != "inbox_received" or not isinstance(event.ref, str) or not event.ref:
+            continue
         message = event.data.get("message") if isinstance(event.data, dict) else None
-        if not isinstance(message, dict):
-            continue
-        key = message.get("idempotency_key")
-        if isinstance(key, str) and key.strip():
-            keys.add(key.strip())
-    return ids, keys
+        key = None
+        if isinstance(message, dict):
+            raw_key = message.get("idempotency_key")
+            if isinstance(raw_key, str) and raw_key.strip():
+                key = raw_key.strip()
+        received.setdefault(event.ref, key)
+    routed_keys = {key for ref, key in received.items() if key and ref in routed_ids}
+    received_keys = {key for ref, key in received.items() if key and ref not in routed_ids}
+    return routed_ids, set(received), routed_keys, received_keys
+
+
+def _message_id_of(path: Path) -> str | None:
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    message_id = obj.get("message_id")
+    if not isinstance(message_id, str) or not message_id.strip():
+        return None
+    return message_id.strip()
 
 
 def _json_files(directory: Path) -> list[Path]:
