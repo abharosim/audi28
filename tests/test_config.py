@@ -28,7 +28,7 @@ def test_example_config_loads(tmp_path, monkeypatch):
     assert cfg.route.not_new_task_phrases == ("不是新任务", "接着上一个")
     assert "你直接回答" in cfg.route.self_phrases
     assert cfg.sessions.idle_timeout_s == 86400
-    assert cfg.approval.__dict__ == {}
+    assert cfg.approval.remind_after_s is None
     assert "timeout_s" not in cfg.approval.__dict__
     assert "DEEPSEEK_API_KEY" not in cfg.__dict__
 

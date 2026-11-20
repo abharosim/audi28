@@ -8,6 +8,7 @@ import os
 import sys
 from pathlib import Path
 
+from audi28.approval import ApprovalCenter
 from audi28.config import Config, ConfigError, prepare
 from audi28.doctor import doctor_report
 from audi28.events import EventLog, EventLogError
@@ -36,6 +37,13 @@ def main(argv: list[str] | None = None) -> int:
     sessions_sub.add_parser("list", help="list sessions that are not closed")
     close = sessions_sub.add_parser("close", help="close one session")
     close.add_argument("session_id")
+    approvals = sub.add_parser("approvals", help="list or decide pending approvals")
+    approvals_sub = approvals.add_subparsers(dest="approvals_command", required=True)
+    approvals_sub.add_parser("list", help="list requests that are still pending")
+    decide = approvals_sub.add_parser("decide", help="record allow or deny for one request")
+    decide.add_argument("request_id")
+    decide.add_argument("decision", choices=("allow", "deny"))
+    decide.add_argument("--note", default=None)
 
     args = parser.parse_args(_normalize_argv(argv))
     config_path = args.config or (Path.cwd() / "config.toml")
@@ -57,6 +65,8 @@ def main(argv: list[str] | None = None) -> int:
         return _grokbot_test(config)
     if args.command == "sessions":
         return _sessions_command(config, args.sessions_command, getattr(args, "session_id", None))
+    if args.command == "approvals":
+        return _approvals_command(config, args)
     supervise(config)
     return 0
 
@@ -119,6 +129,52 @@ def _sessions_command(config: Config, command: str, session_id: str | None) -> i
         },
     )
     print("已关闭。")
+    return 0
+
+
+def _approvals_command(config: Config, args: argparse.Namespace) -> int:
+    events = EventLog(config.root / "data" / "events")
+    url = os.environ.get("AUDI28_GROKBOT_WEBHOOK_URL", "").strip()
+    key = os.environ.get("AUDI28_GROKBOT_WEBHOOK_KEY", "").strip()
+    outbox = None
+    if url and key:
+        outbox = Outbox(
+            config.root / "data" / "outbox" / "grokbot",
+            events,
+            url=url,
+            key=key,
+            header_name=config.grokbot.header_name,
+            header_value=config.grokbot.header_value,
+            timeout_s=config.grokbot.timeout_s,
+            secrets=(url, key),
+        )
+    center = ApprovalCenter(config.root / "data" / "approvals", events=events, outbox=outbox)
+    if args.approvals_command == "list":
+        for record in center.list_pending():
+            print(
+                json.dumps(
+                    {
+                        "id": record.id,
+                        "kind": record.kind,
+                        "source_label": record.source_label,
+                        "tool_name": record.tool_name,
+                        "command": record.command(),
+                        "summary": record.summary,
+                        "status": record.status,
+                        "created_ts": record.created_ts,
+                        "session_id": record.session_id,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return 0
+    result = center.decide(args.request_id, args.decision, message=args.note, source="user")
+    if outbox is not None and not result.applied:
+        outbox.flush_once()
+    if not result.applied:
+        print(result.error or "没有记下这个决定。", file=sys.stderr)
+        return 1
+    print("已记下。")
     return 0
 
 
