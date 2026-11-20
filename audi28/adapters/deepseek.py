@@ -7,6 +7,7 @@ argument. The workspace is `cwd`. The preset is applied with
 
 from __future__ import annotations
 
+import queue
 import re
 import threading
 import uuid
@@ -45,6 +46,7 @@ class DeepSeekBackend:
         events: EventLog,
         pending: PendingStore,
         harness_factory: Callable[..., Any] | None = None,
+        sessions: Any = None,
     ) -> None:
         self.api_key = api_key.strip()
         self.workspace = Path(workspace)
@@ -57,9 +59,13 @@ class DeepSeekBackend:
         self.outbox = outbox
         self.events = events
         self.pending = pending
+        self.sessions = sessions
         self._factory = harness_factory or _real_harness
         self._harness: Any = None
         self._sessions: dict[str, Any] = {}
+        self._queues: dict[str, queue.Queue] = {}
+        self._workers: dict[str, threading.Thread] = {}
+        self._worker_guard = threading.Lock()
         self._permitted: set[str] = set()
         self._waiters: dict[str, _Waiter] = {}
         self._pump: threading.Thread | None = None
@@ -71,31 +77,14 @@ class DeepSeekBackend:
         handle = f"session-{uuid.uuid4().hex}"
         session = self._open_harness().start_session(handle)
         self._sessions[handle] = session
-        self._apply_permission(session)
-        self._say(session_id, "开始处理这条任务。", kind="progress")
-        result = session.run(text)
-        self._say(session_id, _final_text(result), kind="result")
+        if self.sessions is not None:
+            self.sessions.set_handle(session_id, handle)
+        self._submit(handle, session_id, text, "开始处理这条任务。")
         return handle
 
     def run(self, backend_session_id: str, text: str) -> None:
         self._require_key(backend_session_id)
-        session = self._sessions.get(backend_session_id)
-        if session is None:
-            try:
-                session = self._open_harness().resume_session(backend_session_id)
-            except Exception as exc:
-                self._report(
-                    "error",
-                    backend_session_id,
-                    f"恢复 DeepSeek session 失败，没有另建一个。{exc.__class__.__name__}",
-                    "DeepSeek 没能接着上次的会话，没有另开一个。",
-                )
-                return
-            self._sessions[backend_session_id] = session
-        self._apply_permission(session)
-        self._say(backend_session_id, "继续处理这条任务。", kind="progress")
-        result = session.run(text)
-        self._say(backend_session_id, _final_text(result), kind="result")
+        self._submit(backend_session_id, backend_session_id, text, "继续处理这条任务。")
 
     def submit_decision(
         self,
@@ -178,11 +167,63 @@ class DeepSeekBackend:
                 if request is None:
                     return
                 if getattr(request, "method", "") != "approval/request":
+                    if hasattr(client, "respond_error"):
+                        try:
+                            client.respond_error(
+                                request.id,
+                                code=-32601,
+                                message="Method not found",
+                            )
+                        except Exception:
+                            return
                     continue
                 self._handle_approval(client, request)
 
         self._pump = threading.Thread(target=loop, name="audi28-deepseek-approvals", daemon=True)
         self._pump.start()
+
+    def _submit(self, handle: str, audi_session_id: str, text: str, progress: str) -> None:
+        jobs = self._queues.setdefault(handle, queue.Queue())
+        jobs.put((audi_session_id, text, progress))
+        with self._worker_guard:
+            if handle in self._workers:
+                return
+            worker = threading.Thread(
+                target=self._session_loop,
+                args=(handle,),
+                name=f"audi28-deepseek-{handle[-8:]}",
+                daemon=True,
+            )
+            self._workers[handle] = worker
+            worker.start()
+
+    def _session_loop(self, handle: str) -> None:
+        jobs = self._queues[handle]
+        while not self._stop.is_set():
+            try:
+                item = jobs.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is None:
+                return
+            audi_session_id, text, progress = item
+            session = self._sessions.get(handle)
+            if session is None:
+                try:
+                    session = self._open_harness().resume_session(handle)
+                except Exception as exc:
+                    self._report(
+                        "error",
+                        handle,
+                        f"恢复 DeepSeek session 失败，没有另建一个。{exc.__class__.__name__}",
+                        "DeepSeek 没能接着上次的会话，没有另开一个。",
+                    )
+                    continue
+                self._sessions[handle] = session
+            self._apply_permission(session)
+            self._say(audi_session_id, progress, kind="progress")
+            result = session.run(text)
+            self._say(audi_session_id, _final_text(result), kind="result")
 
     def _apply_permission(self, session: Any) -> None:
         if session.id in self._permitted:

@@ -1,13 +1,18 @@
+import json
 import threading
 import time
 from pathlib import Path
 
 from audi28.adapters.deepseek import DeepSeekBackend
 from audi28.approvals import PendingStore
+from audi28.config import load_config
 from audi28.dispatch import Dispatcher
 from audi28.events import EventLog
 from audi28.router import RulesRouter
 from audi28.sessions import SessionStore
+from audi28.supervisor import _transport_loop
+from tests.conftest import write_config
+from tests.test_transport import FakeWebhook
 
 
 class FakeResult:
@@ -38,6 +43,11 @@ class FakeSession:
         self.harness.prompts.append((self.id, text))
         if text.startswith("/permission"):
             return FakeResult("")
+        self.harness.user_started.set()
+        if self.harness.on_user is not None:
+            self.harness.on_user(self.id)
+        if self.harness.block_user is not None:
+            assert self.harness.block_user.wait(timeout=2)
         if self.harness.script == "approval":
             self.harness._queue_impl.put(
                 FakeRequest(
@@ -74,6 +84,10 @@ class FakeHarness:
         self.on_user_question = None
         self.options: dict = {}
         self.fail_resume = False
+        self.block_user: threading.Event | None = None
+        self.user_started = threading.Event()
+        self.on_user = None
+        self.errors: list[tuple] = []
 
     def accept(self, **options):
         self.options = options
@@ -97,6 +111,10 @@ class FakeHarness:
     def respond(self, request_id, result) -> None:
         self.responses.append((request_id, result))
         self.responded.set()
+
+    def respond_error(self, request_id, *, code, message, data=None) -> None:
+        del data
+        self.errors.append((request_id, code, message))
 
     def close(self) -> None:
         self._queue_impl.put(None)
@@ -145,12 +163,13 @@ def test_new_session_uses_workspace_and_permission_mode(tmp_path):
     harness = FakeHarness()
     backend, outbox, _pending, events = _backend(tmp_path, harness)
     handle = backend.start("ses-1", "跑测试")
+    _wait_for(lambda: any(text == "跑测试" for _sid, text in harness.prompts))
+    _wait_for(lambda: any(message["kind"] == "result" for message in outbox.messages))
     assert handle.startswith("session-")
     assert harness.started == [handle]
     assert harness.options["cwd"] == str(tmp_path / "workspace")
     assert (tmp_path / "workspace").is_dir()
     assert any(text.startswith("/permission workspace-write") for _sid, text in harness.prompts)
-    assert any(text == "跑测试" for _sid, text in harness.prompts)
     assert any(message["kind"] == "result" and message["text"].startswith("DeepSeek 说：") for message in outbox.messages)
     assert "sk-test-secret-value" not in "".join(path.read_text() for path in (tmp_path / "events").glob("*.jsonl"))
     backend.close()
@@ -160,16 +179,19 @@ def test_continue_resumes_after_restart_and_does_not_replace_a_missing_session(t
     harness = FakeHarness()
     backend, _outbox, pending, _events = _backend(tmp_path, harness)
     handle = backend.start("ses-1", "第一次")
+    _wait_for(lambda: any(text == "第一次" for _sid, text in harness.prompts))
     restarted, outbox2, _pending2, _events2 = _backend(tmp_path, harness)
     restarted.pending = pending
     restarted.run(handle, "继续")
-    assert harness.resumed == [handle]
+    _wait_for(lambda: harness.resumed == [handle])
+    _wait_for(lambda: any(text == "继续" for _sid, text in harness.prompts))
     assert harness.started == [handle]
 
     missing = FakeHarness(script="")
     missing.fail_resume = True
     other, outbox3, _p, _e = _backend(tmp_path / "missing", missing)
     other.run("session-does-not-exist", "继续")
+    _wait_for(lambda: bool(outbox3.messages))
     assert missing.started == []
     assert any(message["spoken"].startswith("DeepSeek") and "/tmp" not in message["spoken"] for message in outbox3.messages)
     backend.close()
@@ -203,10 +225,10 @@ def test_approval_round_trip_allow_and_deny(tmp_path):
             stored = PendingStore(pending.directory)
             assert stored.list_pending()
             backend.submit_decision(message["request_id"], decision, None)
+            _wait_for(lambda: bool(harness.responses))
             thread.join(timeout=2)
         finally:
             backend.close()
-        assert not thread.is_alive()
         assert harness.responses[-1][1] == {"outcome": outcome}
 
 
@@ -227,6 +249,7 @@ def test_user_question_round_trip(tmp_path):
         assert "/tmp/plan.md" not in message["spoken"]
         assert "/tmp/plan.md" in message["text"]
         backend.submit_decision(message["request_id"], "allow", answers)
+        _wait_for(lambda: bool(harness.question_answers))
         thread.join(timeout=2)
     finally:
         backend.close()
@@ -282,3 +305,137 @@ def test_missing_key_does_not_call_the_sdk(tmp_path):
     assert outbox.messages[-1]["spoken"] == "DeepSeek 还没配好密钥，现在接不上。"
     assert "http" not in outbox.messages[-1]["spoken"]
     assert "/" not in outbox.messages[-1]["spoken"]
+
+
+def test_handle_is_saved_before_the_first_prompt(tmp_path):
+    harness = FakeHarness()
+    backend, _outbox, _pending, _events = _backend(tmp_path, harness)
+    sessions = SessionStore(tmp_path / "sessions")
+    backend.sessions = sessions
+    record = sessions.create(
+        title="第一次",
+        backend="deepseek",
+        backend_session_id="",
+        workspace=str(tmp_path / "workspace"),
+        task_id=None,
+    )
+    seen: list[str] = []
+    harness.on_user = lambda _session_id: seen.append(
+        sessions.get(record.session_id).backend_session_id
+    )
+    try:
+        handle = backend.start(record.session_id, "跑测试")
+        _wait_for(lambda: bool(seen))
+    finally:
+        backend.close()
+    assert seen == [handle]
+    assert sessions.get(record.session_id).backend_session_id == handle
+
+
+def test_unsupported_approval_method_is_rejected(tmp_path):
+    harness = FakeHarness()
+    backend, _outbox, _pending, _events = _backend(tmp_path, harness)
+    try:
+        backend.start("ses-1", "跑测试")
+        _wait_for(lambda: harness.user_started.is_set())
+        harness._queue_impl.put(FakeRequest(9, "unknown/method", {}))
+        _wait_for(lambda: bool(harness.errors))
+    finally:
+        backend.close()
+    assert harness.errors[-1][1] == -32601
+
+
+def test_follow_up_waits_for_the_running_prompt(tmp_path):
+    harness = FakeHarness()
+    harness.block_user = threading.Event()
+    backend, _outbox, _pending, _events = _backend(tmp_path, harness)
+    try:
+        handle = backend.start("ses-1", "第一次")
+        _wait_for(lambda: harness.user_started.is_set())
+        backend.run(handle, "第二次")
+        time.sleep(0.05)
+        assert [text for _sid, text in harness.prompts if not text.startswith("/permission")] == ["第一次"]
+        harness.block_user.set()
+        _wait_for(lambda: "第二次" in [text for _sid, text in harness.prompts])
+    finally:
+        if harness.block_user is not None:
+            harness.block_user.set()
+        backend.close()
+
+
+def test_transport_loop_flushes_the_decision_round_trip(tmp_path, monkeypatch):
+    cases = (
+        ("approval", "allow", "allowed-once", None),
+        ("approval", "deny", "rejected", None),
+        ("question", "allow", None, [{"id": "q1", "selected": "yes"}]),
+    )
+    for script, decision, outcome, answers in cases:
+        root = tmp_path / script / decision
+        monkeypatch.setenv("HOME", str(root))
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        server = FakeWebhook()
+        monkeypatch.setenv("AUDI28_GROKBOT_WEBHOOK_URL", server.url)
+        monkeypatch.setenv("AUDI28_GROKBOT_WEBHOOK_KEY", "test-key")
+        config = load_config(write_config(root))
+        harness = FakeHarness(script=script)
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=_transport_loop,
+            args=(config, stop),
+            kwargs={"harness_factory": harness.accept},
+            daemon=True,
+        )
+        inbox = root / "data" / "inbox" / "audi"
+        inbox.mkdir(parents=True)
+        (inbox / "task.json").write_text(
+            json.dumps(
+                {
+                    "kind": "task",
+                    "message_id": f"msg-{script}-{decision}",
+                    "session_id": None,
+                    "target": None,
+                    "text": "跑测试",
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            thread.start()
+            asking = "approval" if script == "approval" else "user_question"
+
+            def asked(kind=asking):
+                return any(_body(item).get("kind") == kind for item in server.requests)
+
+            _wait_for(asked, timeout=5)
+            request_id = next(
+                _body(item)["request_id"] for item in server.requests if _body(item).get("kind") == asking
+            )
+            (inbox / "decision.json").write_text(
+                json.dumps(
+                    {
+                        "kind": "decision",
+                        "message_id": f"msg-decision-{script}-{decision}",
+                        "request_id": request_id,
+                        "decision": decision,
+                        "answers": answers,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def finished():
+                return any(_body(item).get("kind") == "result" for item in server.requests)
+
+            _wait_for(finished, timeout=5)
+            if script == "approval":
+                assert harness.responses[-1][1] == {"outcome": outcome}
+            else:
+                assert harness.question_answers == [{"answers": answers}]
+        finally:
+            stop.set()
+            thread.join(timeout=2)
+            server.close()
+
+
+def _body(item: dict) -> dict:
+    return json.loads(item["body"])

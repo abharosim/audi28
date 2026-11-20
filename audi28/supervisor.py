@@ -45,7 +45,7 @@ def supervise(config: Config, *, stop: threading.Event | None = None) -> None:
         transport_thread.join(timeout=5)
 
 
-def _transport_loop(config: Config, stop: threading.Event) -> None:
+def _transport_loop(config: Config, stop: threading.Event, harness_factory=None) -> None:
     events = EventLog(config.root / "data" / "events")
     url = os.environ.get("AUDI28_GROKBOT_WEBHOOK_URL", "").strip()
     key = os.environ.get("AUDI28_GROKBOT_WEBHOOK_KEY", "").strip()
@@ -66,6 +66,7 @@ def _transport_loop(config: Config, stop: threading.Event) -> None:
         timeout_s=config.grokbot.timeout_s,
         secrets=(url, key),
     )
+    sessions = SessionStore(config.root / "data" / "sessions")
     backend = DeepSeekBackend(
         api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
         workspace=config.deepseek.workspace,
@@ -78,6 +79,8 @@ def _transport_loop(config: Config, stop: threading.Event) -> None:
         outbox=outbox,
         events=events,
         pending=PendingStore(config.root / "data" / "approvals"),
+        sessions=sessions,
+        harness_factory=harness_factory,
     )
     dispatcher = Dispatcher(
         router=RulesRouter(
@@ -86,7 +89,7 @@ def _transport_loop(config: Config, stop: threading.Event) -> None:
             not_new_task_phrases=config.route.not_new_task_phrases,
             self_phrases=config.route.self_phrases,
         ),
-        sessions=SessionStore(config.root / "data" / "sessions"),
+        sessions=sessions,
         backend=backend,
         events=events,
         workspace=str(config.deepseek.workspace),

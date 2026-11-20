@@ -251,7 +251,7 @@ class _CloseOnTouch(SessionStore):
         return super().touch(session_id, task_id=task_id)
 
 
-def test_closed_during_touch_opens_a_new_session(tmp_path):
+def test_explicit_closed_session_is_rejected(tmp_path):
     events = EventLog(tmp_path / "events")
     sessions = _CloseOnTouch(tmp_path / "sessions")
     created = sessions.create(
@@ -286,6 +286,26 @@ def test_closed_during_touch_opens_a_new_session(tmp_path):
     assert "created" not in actions
     assert any(event.type == "error" for event in events.replay())
     assert sessions.get(created.session_id).status == "closed"
+
+
+def test_inbox_decision_goes_through_decide(tmp_path):
+    dispatcher, _events, _sessions, backend = _dispatcher(tmp_path)
+    seen: dict = {}
+
+    def record(message):
+        seen["message"] = dict(message)
+
+    dispatcher._decide = record
+    dispatcher.handle(
+        {
+            "kind": "decision",
+            "message_id": "msg-d",
+            "request_id": "apr-1",
+            "decision": "allow",
+        }
+    )
+    assert seen["message"]["request_id"] == "apr-1"
+    assert backend.starts == []
 
 
 def test_self_phrase_does_not_call_the_backend(tmp_path):
