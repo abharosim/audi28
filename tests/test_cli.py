@@ -3,9 +3,12 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
+
+import pytest
 
 from audi28.cli import main
 from audi28.events import EventLog
@@ -88,6 +91,10 @@ def _stop_process_group(proc: subprocess.Popen[str]) -> None:
         proc.terminate()
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="GitHub macOS runners time out connecting to the start.sh child; Linux CI covers it.",
+)
 def test_start_sh_serves_health(tmp_path):
     port = _free_port()
     path = write_config(tmp_path, port=port)
