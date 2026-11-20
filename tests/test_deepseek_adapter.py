@@ -69,7 +69,7 @@ class FakeSession:
         elif self.harness.script == "question":
             answer = self.harness.on_user_question(FakeQuestion(), threading.Event())
             self.harness.question_answers.append(answer)
-        return FakeResult("测试已经通过。")
+        return FakeResult(self.harness.reply or "测试已经通过。")
 
 
 class FakeHarness:
@@ -93,6 +93,7 @@ class FakeHarness:
         self.fail_text = ""
         self.closed = False
         self.child: subprocess.Popen | None = None
+        self.reply = ""
         self.errors: list[tuple] = []
 
     def accept(self, **options):
@@ -213,6 +214,49 @@ def test_continue_resumes_after_restart_and_does_not_replace_a_missing_session(t
     restarted.close()
     other.close()
     assert outbox2.messages
+
+
+def test_continued_session_keeps_the_audi_session_id(tmp_path):
+    harness = FakeHarness()
+    backend, outbox, _pending, events = _backend(tmp_path, harness)
+    handle = backend.start("ses-300a13db", "第一次")
+    _wait_for(lambda: any(message["kind"] == "result" for message in outbox.messages))
+    first = next(message for message in outbox.messages if message["kind"] == "result")
+    assert first["session_id"] == "ses-300a13db"
+    assert first["backend_session_id"] == handle
+    assert handle.startswith("session-")
+
+    restarted, outbox2, _pending2, events2 = _backend(tmp_path / "again", harness)
+    restarted.run(handle, "继续", audi_session_id="ses-300a13db")
+    _wait_for(lambda: any(message["kind"] == "result" for message in outbox2.messages))
+    second = next(message for message in outbox2.messages if message["kind"] == "result")
+    assert second["session_id"] == "ses-300a13db"
+    assert second["backend_session_id"] == handle
+    assert second["session_id"] != handle
+    reply_refs = [event.ref for event in events2.replay() if event.type == "reply"]
+    assert reply_refs == ["ses-300a13db"]
+    assert events.replay()[-1].ref == "ses-300a13db"
+    backend.close()
+    restarted.close()
+
+
+def test_spoken_text_strips_markdown_and_keeps_text(tmp_path):
+    harness = FakeHarness()
+    harness.reply = "看 [hello.py](hello.py) 和 **加粗**。\n```python\nprint(1)\n```"
+    backend, outbox, _pending, _events = _backend(tmp_path, harness)
+    backend.start("ses-1", "跑测试")
+    _wait_for(lambda: any(message["kind"] == "result" for message in outbox.messages))
+    message = next(item for item in outbox.messages if item["kind"] == "result")
+    assert "[hello.py](hello.py)" in message["text"]
+    assert "**加粗**" in message["text"]
+    assert "```" in message["text"]
+    assert "[hello.py](hello.py)" not in message["spoken_text"]
+    assert "**" not in message["spoken_text"]
+    assert "```" not in message["spoken_text"]
+    assert "hello.py" in message["spoken_text"]
+    assert "加粗" in message["spoken_text"]
+    assert message["spoken"] == message["spoken_text"]
+    backend.close()
 
 
 def test_approval_round_trip_allow_and_deny(tmp_path):

@@ -140,7 +140,11 @@ class Dispatcher:
             return
         self._session_event("continued", record, reason)
         try:
-            self.backend.run(record.backend_session_id, task.text)
+            self.backend.run(
+                record.backend_session_id,
+                task.text,
+                audi_session_id=record.session_id,
+            )
         except BackendNotConfigured as exc:
             self._not_configured(task.message_id, str(exc))
 
