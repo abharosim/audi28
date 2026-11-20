@@ -1,6 +1,6 @@
 # audi28 设计文档
 
-> 状态：2026-11-20 的决定已写入正文。Phase 1 的骨架、传输、规则路由、session 存储和 DeepSeek adapter 已在本仓库；审批中心的仪表盘尚未实现。
+> 状态：2026-11-20 的决定已写入正文。Phase 1 的骨架、传输、规则路由、session 存储、DeepSeek adapter，以及审批中心和本机仪表盘已在本仓库。Claude Code 与 Codex 的 hook 适配器还没做。
 > 日期：2026-11-19 起草（America/New_York），2026-11-20 按 Ruoran 的决定改定。
 > 项目位置：Mac 上 `~/Code/audi28`，与 `~/Code/audi27` 并列。本仓库就是这份实现。
 
@@ -283,7 +283,13 @@ Claude Code / Codex 以后映射为 hook 的 `allow` / `deny`（可选 `message`
 
 状态：`pending` → `decided` | `cancelled_by_backend`。同一 `idempotency_key` 已有 pending 则复用；已有终态则不再问用户，并把原决定返回给 backend（若 backend 仍在等）。官方说取消后迟到的回复会被丢掉。连接断开时，DeepSeek 侧可能已经把这次请求 fail closed；那是运行时的行为。audi28 自己不补一条 deny。若确认 backend 已取消，状态记为 `cancelled_by_backend`，并告诉 Audi。
 
-审批和提问一直等到用户回答。配置里没有 `timeout_s`，也没有 `timeout_action`。不要把 600 秒写回来。pending 追加为事件，重启时从事件日志重建还没有决定的条目。启动时对每一条再发一次 webhook（`reminder: true`），仪表盘列出它们。提醒发不出去也保持 `pending`，不改成 deny。仪表盘不提供「一键永久允许」。
+审批和提问一直等到用户回答。配置里没有 `timeout_s`，也没有 `timeout_action`。不要把 600 秒写回来。pending 追加为事件，重启时从事件日志重建还没有决定的条目。启动时对每一条再发一次 webhook（`reminder: true`），文案以「DeepSeek 在问你：」开头，仪表盘列出它们。提醒发不出去也保持 `pending`，不改成 deny。仪表盘不提供「一键永久允许」。
+
+可选的 `[approval] remind_after_s` 默认不写。写了就在这么多秒后把同一条提问再发给 Audi 一次，状态仍是 `pending`，不会变成拒绝。
+
+本机可以用 `audi28 approvals list` 和 `audi28 approvals decide <id> allow|deny [--note]`。决定和 inbox、仪表盘走同一个 `decide`。同一条决定到第二次不再改状态，并给 Audi 一条说清楚的错误。不知道的 id 同样回错误。
+
+仪表盘在 `127.0.0.1:8728`。除 `/health` 外需要环境变量 `AUDI28_DASHBOARD_TOKEN`（`Authorization: Bearer`，或 `?token=`）。批准按钮要求 JSON、loopback Host，并拒绝跨站 `Sec-Fetch-Site`。
 
 Claude Code 自己的 HTTP hook 默认最多等 600 秒，Codex 示例脚本里的 curl 也写了 `--max-time 600`（见 sources 文档）。那是那些工具的外部上限，不是 audi28 的策略。audi28 不会到点发 deny。Phase 2/3 接上它们时要单独处理这个外部上限。
 

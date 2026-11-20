@@ -12,7 +12,7 @@ audi28 是独立项目，放在 `~/Code/audi28`，和 `~/Code/audi27` 并列。�
 
 ## 现状
 
-仓库里已经有骨架、传输、规则路由、session 存储，以及 DeepSeek adapter。CLI 有 `events`、`supervise`、`web`、`doctor`、`grokbot test`、`sessions list`、`sessions close`。`start.sh` 在 `[deepseek] enabled = true` 时会加上 `--extra deepseek`。没有 `DEEPSEEK_API_KEY` 时不会连接 DeepSeek，也不会崩溃。审批中心的仪表盘还没做。没有说要新任务时，继续最近一个仍开放的 session。`不是新任务` 和 `接着上一个` 不会另开 session。
+仓库里已经有骨架、传输、规则路由、session 存储、DeepSeek adapter，以及审批中心和本机仪表盘。CLI 有 `events`、`supervise`、`web`、`doctor`、`grokbot test`、`sessions list`、`sessions close`、`approvals list`、`approvals decide`。`start.sh` 在 `[deepseek] enabled = true` 时会加上 `--extra deepseek`。没有 `DEEPSEEK_API_KEY` 时不会连接 DeepSeek，也不会崩溃。没有说要新任务时，继续最近一个仍开放的 session。`不是新任务` 和 `接着上一个` 不会另开 session。仪表盘除 `/health` 外需要 `AUDI28_DASHBOARD_TOKEN`。
 
 ```bash
 uv sync --extra dev
@@ -22,7 +22,7 @@ cp config.example.toml config.toml
 uv run pytest
 uv run audi28 doctor
 ./start.sh
-# 仪表盘：http://127.0.0.1:8728
+# 仪表盘：http://127.0.0.1:8728/?token=$AUDI28_DASHBOARD_TOKEN
 ```
 
 传输：Audi 不能访问本机 HTTP。任务和审批决定写成 `data/inbox/audi/*.json`。Ruoran 已批准 Audi 把 JSON 写入 `~/Code/audi28/data/inbox/audi/`（目录不存在可以建），其它 Mac 写入仍要单独批准。同一 `message_id` 只处理一次。坏 JSON、symlink 和超过 1MB 的文件会进 `quarantine/`。audi28 把要发给 Audi 的 JSON 先写入 `data/outbox/grokbot/`，再 POST 到 `AUDI28_GROKBOT_WEBHOOK_URL`。失败会留下，重启后续发。`uv run audi28 grokbot test` 发一条测试消息。CI 只用本机假 HTTP server。

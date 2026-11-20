@@ -247,6 +247,27 @@ def test_approval_round_trip_allow_and_deny(tmp_path):
         assert harness.responses[-1][1] == {"outcome": outcome}
 
 
+def test_a_stored_decision_is_delivered_to_the_waiting_sdk(tmp_path):
+    harness = FakeHarness(script="approval")
+    backend, outbox, pending, _events = _backend(tmp_path, harness)
+    thread = threading.Thread(target=lambda: backend.start("ses-1", "跑测试"))
+    thread.start()
+    try:
+        _wait_for(lambda: any(message["kind"] == "approval" for message in outbox.messages))
+        request_id = next(message["request_id"] for message in outbox.messages if message["kind"] == "approval")
+        pending.decide(request_id, "allow")
+
+        def delivered() -> bool:
+            backend.deliver_decisions()
+            return bool(harness.responses)
+
+        _wait_for(delivered)
+    finally:
+        backend.close()
+        thread.join(timeout=2)
+    assert harness.responses[-1][1] == {"outcome": "allowed-once"}
+
+
 def test_user_question_round_trip(tmp_path):
     harness = FakeHarness(script="question")
     backend, outbox, _pending, _events = _backend(tmp_path, harness)

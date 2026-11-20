@@ -187,7 +187,10 @@ class Dispatcher:
             return
         answers = message.get("answers") if isinstance(message.get("answers"), list) else None
         decision = message.get("decision") if isinstance(message.get("decision"), str) else None
-        submit(request_id.strip(), decision, answers)
+        note = message.get("note") if isinstance(message.get("note"), str) else None
+        if note is None and isinstance(message.get("text"), str):
+            note = message.get("text")
+        submit(request_id.strip(), decision, answers, note)
 
     def _close(self, message: Mapping[str, Any]) -> None:
         session_id = message.get("session_id")

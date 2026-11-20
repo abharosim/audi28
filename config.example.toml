@@ -10,6 +10,9 @@
 [web]
 host = "127.0.0.1"
 port = 8728
+# 除 /health 外，仪表盘需要环境变量 AUDI28_DASHBOARD_TOKEN。
+# 用 Authorization: Bearer，或打开 http://127.0.0.1:8728/?token=...
+# 不要把 token 写进这个文件。
 
 [events]
 # 事件写在 data/events/YYYY-MM-DD.jsonl。这里暂时没有可调项，section 先留着。
@@ -63,6 +66,8 @@ initialize_timeout_seconds = 30
 # 重启后仍在，会再次提醒，仪表盘上看得到。
 # 不要加 timeout_s 或 timeout_action。
 # 不对写文件、shell、装包、git、工作区以外路径做自动批准。
+# 可选：超过这么多秒还没回答，就再发一次提问。不写这项就不会重复提醒，也永远不会因此拒绝。
+# remind_after_s = 900
 
 # 以后：Claude Code 的 PermissionRequest HTTP hook 会 POST 到本机。
 [hooks]

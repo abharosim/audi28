@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from audi28.approvals import PendingStore
+from audi28.approval import ApprovalCenter
 from audi28.backend import BackendNotConfigured
 from audi28.events import EventLog
 
@@ -44,7 +44,7 @@ class DeepSeekBackend:
         initialize_timeout_seconds: float,
         outbox: Any,
         events: EventLog,
-        pending: PendingStore,
+        pending: ApprovalCenter,
         harness_factory: Callable[..., Any] | None = None,
         sessions: Any = None,
     ) -> None:
@@ -59,6 +59,8 @@ class DeepSeekBackend:
         self.outbox = outbox
         self.events = events
         self.pending = pending
+        if hasattr(self.pending, "bind"):
+            self.pending.bind(events=events, outbox=outbox)
         self.sessions = sessions
         self._factory = harness_factory or _real_harness
         self._harness: Any = None
@@ -92,27 +94,28 @@ class DeepSeekBackend:
         request_id: str,
         decision: str | None,
         answers: list[dict[str, Any]] | None = None,
+        message: str | None = None,
     ) -> None:
-        record = self.pending.resolve(request_id, decision, answers)
-        if record is None:
-            self.events.append(
-                type="error",
-                source="deepseek",
-                ref=request_id,
-                data={"reason": "没有这条待处理的提问"},
-            )
-            return
-        self.events.append(
-            type="decision",
-            source="deepseek",
-            ref=request_id,
-            data={"decision": decision, "status": "decided"},
-        )
+        result = self.pending.decide(request_id, decision, answers, message=message, source="user")
+        if result.applied and result.decision is not None:
+            self._wake(request_id, decision, answers)
+            self.pending.mark_delivered(result.decision.id)
+        return result
+
+    def deliver_decisions(self) -> None:
+        for made in self.pending.undelivered():
+            if made.request_id not in self._waiters:
+                continue
+            self._wake(made.request_id, made.decision, made.answers)
+            self.pending.mark_delivered(made.id)
+
+    def _wake(self, request_id: str, decision: str | None, answers: list[dict[str, Any]] | None) -> None:
         waiter = self._waiters.get(request_id)
-        if waiter is not None:
-            waiter.decision = decision
-            waiter.answers = answers
-            waiter.event.set()
+        if waiter is None:
+            return
+        waiter.decision = decision
+        waiter.answers = answers
+        waiter.event.set()
 
     def close(self) -> None:
         self._stop.set()
@@ -265,16 +268,16 @@ class DeepSeekBackend:
             call_id=_text(payload.get("callId")) or None,
             reason=reason or None,
             command=command or None,
+            text=_approval_text(tool, command, reason),
+            spoken=_approval_spoken(tool),
         )
-        self.events.append(
-            type="approval",
-            source="deepseek",
-            ref=record.id,
-            data={"kind": "approval", "tool_name": tool, "status": "pending"},
-        )
-        self._ask("approval", record.id, _approval_text(tool, command, reason), _approval_spoken(tool))
-        waiter = _Waiter(threading.Event())
-        self._waiters[record.id] = waiter
+        if record.status == "decided":
+            client.respond(request.id, {"outcome": _approval_outcome(record.decision)})
+            return
+        waiter = self._waiters.get(record.id)
+        if waiter is None:
+            waiter = _Waiter(threading.Event())
+            self._waiters[record.id] = waiter
         while not waiter.event.wait(timeout=0.2):
             if self._stop.is_set():
                 break
@@ -286,43 +289,31 @@ class DeepSeekBackend:
 
     def _on_user_question(self, request: Any, cancelled: threading.Event) -> dict[str, Any]:
         questions = list(getattr(request, "questions", []) or [])
+        preview = _text(questions[0].get("question")) if questions and isinstance(questions[0], dict) else ""
         record = self.pending.create(
             kind="user_question",
             session_id=str(getattr(request, "session_id", "") or ""),
             backend_session_id=str(getattr(request, "session_id", "") or ""),
             rpc_id=str(getattr(request, "request_id", "") or ""),
             questions=questions,
+            reason=preview or None,
+            text=_question_text(preview),
+            spoken=_question_spoken(preview),
         )
-        preview = _text(questions[0].get("question")) if questions and isinstance(questions[0], dict) else ""
-        self.events.append(
-            type="approval",
-            source="deepseek",
-            ref=record.id,
-            data={"kind": "user_question", "status": "pending"},
-        )
-        self._ask("user_question", record.id, _question_text(preview), _question_spoken(preview))
-        waiter = _Waiter(threading.Event())
-        self._waiters[record.id] = waiter
+        if record.status == "decided":
+            if record.decision in {None, "deny", "cancel"}:
+                return {"cancelled": True}
+            return {"answers": _normalize_answers(record.answers)}
+        waiter = self._waiters.get(record.id)
+        if waiter is None:
+            waiter = _Waiter(threading.Event())
+            self._waiters[record.id] = waiter
         while not waiter.event.wait(timeout=0.2):
             if cancelled.is_set() or self._stop.is_set():
                 return {"cancelled": True}
         if waiter.decision in {None, "deny", "cancel"}:
             return {"cancelled": True}
         return {"answers": _normalize_answers(waiter.answers)}
-
-    def _ask(self, kind: str, request_id: str, text: str, spoken: str) -> None:
-        self.outbox.enqueue(
-            {
-                "kind": kind,
-                "request_id": request_id,
-                "source_agent": "deepseek",
-                "source_label": "DeepSeek",
-                "status": "needs_decision",
-                "text": text,
-                "spoken": spoken,
-                "spoken_text": spoken,
-            }
-        )
 
     def _say(self, session_id: str, message: str, *, kind: str) -> None:
         spoken = _voice(message)

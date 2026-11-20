@@ -7,7 +7,7 @@ import signal
 import threading
 
 from audi28.adapters.deepseek import DeepSeekBackend
-from audi28.approvals import PendingStore
+from audi28.approval import ApprovalCenter
 from audi28.config import Config
 from audi28.dispatch import Dispatcher
 from audi28.events import EventLog
@@ -23,11 +23,20 @@ def supervise(config: Config, *, stop: threading.Event | None = None) -> None:
     owns_stop = stop is None
     if stop is None:
         stop = threading.Event()
-    server = WebServer(config.web.host, config.web.port)
+    runtime = _build_runtime(config)
+    server = WebServer(
+        config.web.host,
+        config.web.port,
+        token=os.environ.get("AUDI28_DASHBOARD_TOKEN", ""),
+        sessions=runtime.sessions,
+        approvals=runtime.center,
+        events=runtime.events,
+        decider=runtime.backend.submit_decision,
+    )
     web_thread = threading.Thread(target=server.serve_forever, name="audi28-web")
     transport_thread = threading.Thread(
-        target=_transport_loop,
-        args=(config, stop),
+        target=_run_transport,
+        args=(runtime, config, stop),
         name="audi28-transport",
         daemon=True,
     )
@@ -45,7 +54,12 @@ def supervise(config: Config, *, stop: threading.Event | None = None) -> None:
         transport_thread.join(timeout=8)
 
 
-def _transport_loop(config: Config, stop: threading.Event, harness_factory=None) -> None:
+class _Runtime:
+    def __init__(self, **parts: object) -> None:
+        self.__dict__.update(parts)
+
+
+def _build_runtime(config: Config, harness_factory=None) -> _Runtime:
     events = EventLog(config.root / "data" / "events")
     url = os.environ.get("AUDI28_GROKBOT_WEBHOOK_URL", "").strip()
     key = os.environ.get("AUDI28_GROKBOT_WEBHOOK_KEY", "").strip()
@@ -67,6 +81,7 @@ def _transport_loop(config: Config, stop: threading.Event, harness_factory=None)
         secrets=(url, key),
     )
     sessions = SessionStore(config.root / "data" / "sessions")
+    center = ApprovalCenter(config.root / "data" / "approvals", events=events, outbox=outbox)
     backend = DeepSeekBackend(
         api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
         workspace=config.deepseek.workspace,
@@ -78,7 +93,7 @@ def _transport_loop(config: Config, stop: threading.Event, harness_factory=None)
         initialize_timeout_seconds=config.deepseek.initialize_timeout_seconds,
         outbox=outbox,
         events=events,
-        pending=PendingStore(config.root / "data" / "approvals"),
+        pending=center,
         sessions=sessions,
         harness_factory=harness_factory,
     )
@@ -95,21 +110,45 @@ def _transport_loop(config: Config, stop: threading.Event, harness_factory=None)
         workspace=str(config.deepseek.workspace),
         outbox=outbox,
     )
+    return _Runtime(
+        events=events,
+        inbox=inbox,
+        outbox=outbox,
+        sessions=sessions,
+        center=center,
+        backend=backend,
+        dispatcher=dispatcher,
+        url=url,
+        key=key,
+    )
+
+
+def _transport_loop(config: Config, stop: threading.Event, harness_factory=None) -> None:
+    _run_transport(_build_runtime(config, harness_factory), config, stop)
+
+
+def _run_transport(runtime: _Runtime, config: Config, stop: threading.Event) -> None:
+    announced = False
     try:
         while not stop.is_set():
             try:
-                for message in _messages_to_dispatch(inbox):
-                    dispatcher.handle(message)
+                for message in _messages_to_dispatch(runtime.inbox):
+                    runtime.dispatcher.handle(message)
                     message_id = message.get("message_id")
                     if isinstance(message_id, str) and message_id.strip():
-                        inbox.complete(message_id.strip())
-                outbox.flush_once()
+                        runtime.inbox.complete(message_id.strip())
+                if not announced:
+                    runtime.center.reannounce_pending()
+                    announced = True
+                runtime.center.remind_due(config.approval.remind_after_s)
+                runtime.backend.deliver_decisions()
+                runtime.outbox.flush_once()
             except Exception as exc:
                 # Keep the dashboard up, but do not hide the failure.
-                _record_loop_error(events, exc, secrets=(url, key))
+                _record_loop_error(runtime.events, exc, secrets=(runtime.url, runtime.key))
             stop.wait(config.inbox.poll_s)
     finally:
-        backend.close()
+        runtime.backend.close()
 
 
 def _messages_to_dispatch(inbox: Inbox) -> list[dict]:

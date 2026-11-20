@@ -73,7 +73,13 @@ class DeepSeekConfig:
 
 @dataclass(frozen=True)
 class ApprovalConfig:
-    """Pending approvals wait for the user. There is no timeout."""
+    """Pending approvals wait for the user. There is no timeout.
+
+    remind_after_s is optional. None means the question is not repeated.
+    A reminder never turns into a deny.
+    """
+
+    remind_after_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -121,7 +127,7 @@ _SPECS: dict[str, tuple[set[str], set[str]]] = {
         },
         {"reasoning_effort", "max_tokens"},
     ),
-    "approval": (set(), set()),
+    "approval": (set(), {"remind_after_s"}),
     "hooks": ({"enabled", "token_env"}, set()),
 }
 
@@ -181,7 +187,7 @@ def load_config(path: Path) -> Config:
         route=_route(raw["route"]),
         sessions=_sessions(raw["sessions"]),
         deepseek=_deepseek(raw["deepseek"], root),
-        approval=ApprovalConfig(),
+        approval=_approval(raw["approval"]),
         hooks=_hooks(raw["hooks"]),
     )
 
@@ -300,6 +306,14 @@ def _deepseek(table: Mapping[str, object], root: Path) -> DeepSeekConfig:
         ),
         reasoning_effort=reasoning,
         max_tokens=max_tokens,
+    )
+
+
+def _approval(table: Mapping[str, object]) -> ApprovalConfig:
+    if "remind_after_s" not in table:
+        return ApprovalConfig(remind_after_s=None)
+    return ApprovalConfig(
+        remind_after_s=_require_number("approval", "remind_after_s", table["remind_after_s"])
     )
 
 
