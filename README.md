@@ -61,6 +61,10 @@ uv run python scripts/mock_deepseek.py
 
 DeepSeek 的默认工作区是 `~/Code/deepseek-workspace`（可在 `config.toml` 里改），权限预设是 `workspace-write`。工具调用仍要审批。用户没有明确说要新任务时，继续最近一个仍开放的 session。审批和提问没有超时自动拒绝，一直等到回答。提示在会话自己的线程里跑，传输循环继续收 inbox、发 webhook。backend session id 在 `start_session()` 返回后、第一轮提示开始前就写入 session 文件。进程收到 SIGINT 或 SIGTERM，或者传输循环退出时，会关掉 DeepSeek 运行时，避免上次的 `dsh` 占着 session。
 
+macOS 上 DeepSeek 的 `dsh` 会套进 `sandbox-exec`。SDK 0.2.2rc2 只提供 `dsh_bin` 来替换运行时可执行文件，不能在它前面加命令。audi28 把 `dsh_bin` 指到 `data/sandbox/dsh-sandboxed`，这个脚本再 `exec /usr/bin/sandbox-exec -f data/sandbox/deepseek.sb` 去跑真正的 `dsh`。沙箱默认允许，然后拒绝读取和写入用户家目录，只重新放开配置的工作区、`data/dsh-home`，以及读 `.venv` 和运行时自己的文件。项目目录里的 `.env` 一律读不到，密钥只从环境变量进运行时。没有 `sandbox-exec` 的系统会记一条 WARN，然后不套沙箱继续跑。`[deepseek.sandbox] extra_read_paths` 可以再加只读目录。
+
+沙箱没关上的口子：网络仍然开着，DeepSeek 还能访问 API；`/tmp`、`/private/tmp`、`/usr`、`/System`、`/Library`、`/opt/homebrew` 这些系统路径仍可读。家目录里的 `~/.ssh` 和 `~/.aws` 读不到。
+
 ## 许可证与密钥
 
 不要把 API key 或 webhook 密钥写进 `config.toml` 或仓库。用项目根目录的 `.env`（gitignore），或导出到环境变量。`DEEPSEEK_API_KEY` 由 Ruoran 稍后提供。没有这把密钥时，进程不崩溃；`audi28 doctor` 会说明把密钥写进 `~/Code/audi28/.env` 或环境变量。

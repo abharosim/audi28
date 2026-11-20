@@ -395,6 +395,9 @@ class ApprovalCenter:
             "spoken": record.spoken_text,
             "spoken_text": record.spoken_text,
         }
+        backend_session_id = record.detail.get("backend_session_id") if isinstance(record.detail, dict) else None
+        if isinstance(backend_session_id, str) and backend_session_id:
+            payload["backend_session_id"] = backend_session_id
         if reminder:
             payload["reminder"] = True
         self.outbox.enqueue(payload)

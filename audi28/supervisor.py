@@ -15,6 +15,7 @@ from audi28.config import Config
 from audi28.dispatch import Dispatcher
 from audi28.events import EventLog
 from audi28.router import RulesRouter
+from audi28.sandbox import prepare_sandbox
 from audi28.sessions import SessionStore
 from audi28.transport import Inbox, Outbox
 from audi28.web import WebServer
@@ -87,6 +88,16 @@ def _build_runtime(config: Config, harness_factory=None) -> _Runtime:
     )
     sessions = SessionStore(config.root / "data" / "sessions")
     center = ApprovalCenter(config.root / "data" / "approvals", events=events, outbox=outbox)
+    sandbox = prepare_sandbox(
+        enabled=config.deepseek.sandbox.enabled,
+        home=_home_dir(),
+        workspace=config.deepseek.workspace,
+        dsh_home=config.deepseek.dsh_home,
+        project_root=config.root,
+        extra_read_paths=config.deepseek.sandbox.extra_read_paths,
+    )
+    if sandbox.warning:
+        events.append(type="error", source="sandbox", ref=None, data={"reason": sandbox.warning})
     backend = DeepSeekBackend(
         api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
         workspace=config.deepseek.workspace,
@@ -101,6 +112,7 @@ def _build_runtime(config: Config, harness_factory=None) -> _Runtime:
         pending=center,
         sessions=sessions,
         harness_factory=harness_factory,
+        dsh_bin=sandbox.dsh_bin,
     )
     dispatcher = Dispatcher(
         router=RulesRouter(
@@ -176,6 +188,10 @@ def _messages_to_dispatch(inbox: Inbox) -> list[dict]:
         seen.add(message_id)
         chosen.append(message)
     return chosen
+
+
+def _home_dir() -> Path:
+    return Path(os.environ.get("HOME") or str(Path.home())).expanduser()
 
 
 def _write_supervisor_state(root: Path, *, port: int) -> None:

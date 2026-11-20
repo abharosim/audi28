@@ -47,6 +47,7 @@ class DeepSeekBackend:
         pending: ApprovalCenter,
         harness_factory: Callable[..., Any] | None = None,
         sessions: Any = None,
+        dsh_bin: str | None = None,
     ) -> None:
         self.api_key = api_key.strip()
         self.workspace = Path(workspace)
@@ -62,6 +63,8 @@ class DeepSeekBackend:
         if hasattr(self.pending, "bind"):
             self.pending.bind(events=events, outbox=outbox)
         self.sessions = sessions
+        self.dsh_bin = dsh_bin
+        self._audi_by_backend: dict[str, str] = {}
         self._factory = harness_factory or _real_harness
         self._harness: Any = None
         self._harness_lock = threading.Lock()
@@ -85,9 +88,10 @@ class DeepSeekBackend:
         self._submit(handle, session_id, text, "开始处理这条任务。")
         return handle
 
-    def run(self, backend_session_id: str, text: str) -> None:
-        self._require_key(backend_session_id)
-        self._submit(backend_session_id, backend_session_id, text, "继续处理这条任务。")
+    def run(self, backend_session_id: str, text: str, *, audi_session_id: str | None = None) -> None:
+        audi_id = audi_session_id or backend_session_id
+        self._require_key(audi_id)
+        self._submit(backend_session_id, audi_id, text, "继续处理这条任务。")
 
     def submit_decision(
         self,
@@ -163,8 +167,9 @@ class DeepSeekBackend:
                 approval_requests=True,
                 initialize_timeout_seconds=self.initialize_timeout_seconds,
                 on_user_question=self._on_user_question,
-                permission_mode=self.permission_mode,
-            )
+            permission_mode=self.permission_mode,
+            dsh_bin=self.dsh_bin,
+        )
             self._harness = harness
             self._start_pump(harness)
             return harness
@@ -197,6 +202,7 @@ class DeepSeekBackend:
         self._pump.start()
 
     def _submit(self, handle: str, audi_session_id: str, text: str, progress: str) -> None:
+        self._audi_by_backend[handle] = audi_session_id
         jobs = self._queues.setdefault(handle, queue.Queue())
         jobs.put((audi_session_id, text, progress))
         with self._worker_guard:
@@ -228,15 +234,16 @@ class DeepSeekBackend:
                 except Exception as exc:
                     self._report(
                         "error",
-                        handle,
+                        audi_session_id,
                         f"恢复 DeepSeek session 失败，没有另建一个。{exc.__class__.__name__}",
                         "DeepSeek 没能接着上次的会话，没有另开一个。",
+                        backend_session_id=handle,
                     )
                     continue
                 self._sessions[handle] = session
             try:
                 self._apply_permission(session)
-                self._say(audi_session_id, progress, kind="progress")
+                self._say(audi_session_id, progress, kind="progress", backend_session_id=handle)
                 result = session.run(text)
             except Exception as exc:
                 self._report(
@@ -244,9 +251,10 @@ class DeepSeekBackend:
                     audi_session_id,
                     f"DeepSeek 这一轮失败了。{exc.__class__.__name__}",
                     "DeepSeek 这一轮没做完。",
+                    backend_session_id=handle,
                 )
                 continue
-            self._say(audi_session_id, _final_text(result), kind="result")
+            self._say(audi_session_id, _final_text(result), kind="result", backend_session_id=handle)
 
     def _apply_permission(self, session: Any) -> None:
         if session.id in self._permitted:
@@ -259,10 +267,11 @@ class DeepSeekBackend:
         tool = _text(payload.get("toolName"))
         reason = _text(payload.get("reason"))
         command = _text(payload.get("command") or payload.get("path") or payload.get("cwd"))
+        backend_sid = _text(payload.get("sessionId"))
         record = self.pending.create(
             kind="approval",
-            session_id=_text(payload.get("sessionId")),
-            backend_session_id=_text(payload.get("sessionId")),
+            session_id=self._audi_by_backend.get(backend_sid, backend_sid),
+            backend_session_id=backend_sid,
             rpc_id=str(request.id),
             tool_name=tool,
             call_id=_text(payload.get("callId")) or None,
@@ -290,10 +299,11 @@ class DeepSeekBackend:
     def _on_user_question(self, request: Any, cancelled: threading.Event) -> dict[str, Any]:
         questions = list(getattr(request, "questions", []) or [])
         preview = _text(questions[0].get("question")) if questions and isinstance(questions[0], dict) else ""
+        backend_sid = str(getattr(request, "session_id", "") or "")
         record = self.pending.create(
             kind="user_question",
-            session_id=str(getattr(request, "session_id", "") or ""),
-            backend_session_id=str(getattr(request, "session_id", "") or ""),
+            session_id=self._audi_by_backend.get(backend_sid, backend_sid),
+            backend_session_id=backend_sid,
             rpc_id=str(getattr(request, "request_id", "") or ""),
             questions=questions,
             reason=preview or None,
@@ -315,18 +325,24 @@ class DeepSeekBackend:
             return {"cancelled": True}
         return {"answers": _normalize_answers(waiter.answers)}
 
-    def _say(self, session_id: str, message: str, *, kind: str) -> None:
+    def _say(self, session_id: str, message: str, *, kind: str, backend_session_id: str | None = None) -> None:
         spoken = _voice(message)
         self.events.append(
             type="reply" if kind == "result" else "task",
             source="deepseek",
             ref=session_id,
-            data={"kind": kind, "text": message},
+            data={
+                "kind": kind,
+                "text": message,
+                "session_id": session_id,
+                "backend_session_id": backend_session_id,
+            },
         )
         self.outbox.enqueue(
             {
                 "kind": "result" if kind == "result" else "progress",
                 "session_id": session_id,
+                "backend_session_id": backend_session_id,
                 "source_agent": "deepseek",
                 "source_label": "DeepSeek",
                 "status": "done" if kind == "result" else "running",
@@ -336,11 +352,26 @@ class DeepSeekBackend:
             }
         )
 
-    def _report(self, kind: str, ref: str, text: str, spoken: str) -> None:
-        self.events.append(type="error", source="deepseek", ref=ref, data={"reason": text})
+    def _report(
+        self,
+        kind: str,
+        ref: str,
+        text: str,
+        spoken: str,
+        *,
+        backend_session_id: str | None = None,
+    ) -> None:
+        self.events.append(
+            type="error",
+            source="deepseek",
+            ref=ref,
+            data={"reason": text, "session_id": ref, "backend_session_id": backend_session_id},
+        )
         self.outbox.enqueue(
             {
                 "kind": kind,
+                "session_id": ref,
+                "backend_session_id": backend_session_id,
                 "source_label": "DeepSeek",
                 "status": "failed",
                 "text": text,
@@ -364,6 +395,7 @@ def _real_harness(**options: Any) -> Any:
             approval_requests=True,
             initialize_timeout_seconds=options["initialize_timeout_seconds"],
             on_user_question=options["on_user_question"],
+            dsh_bin=options.get("dsh_bin"),
         )
     )
 
@@ -430,8 +462,18 @@ def _final_text(result: Any) -> str:
 
 
 def _voice(text: str) -> str:
-    cleaned = _PATHISH.sub("", text)
+    cleaned = _strip_markdown(text)
+    cleaned = _PATHISH.sub("", cleaned)
     return " ".join(cleaned.split())
+
+
+def _strip_markdown(text: str) -> str:
+    without_fences = re.sub(r"```[A-Za-z0-9_-]*", "", text).replace("```", "")
+    without_links = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", without_fences)
+    without_bold = re.sub(r"\*\*([^*]+)\*\*", r"\1", without_links)
+    without_bold = re.sub(r"__([^_]+)__", r"\1", without_bold)
+    without_em = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", without_bold)
+    return without_em.replace("`", "")
 
 
 def _text(value: Any) -> str:

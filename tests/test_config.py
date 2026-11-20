@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import sys
+
 import pytest
 
 from audi28.config import ConfigError, load_config, load_dotenv
@@ -22,6 +24,8 @@ def test_example_config_loads(tmp_path, monkeypatch):
     assert cfg.deepseek.permission_mode == "workspace-write"
     assert cfg.deepseek.approval_requests is True
     assert cfg.deepseek.dsh_home == (path.parent / "data" / "dsh-home").resolve()
+    assert cfg.deepseek.sandbox.enabled is (sys.platform == "darwin")
+    assert cfg.deepseek.sandbox.extra_read_paths == ()
     assert cfg.route.llm is False
     assert cfg.route.default == "deepseek"
     assert cfg.route.new_task_phrases == ("新任务", "开一个新的", "另外一个任务", "new task")
@@ -40,6 +44,32 @@ def test_unknown_section_is_rejected(tmp_path, monkeypatch):
     path.write_text(text, encoding="utf-8")
 
     with pytest.raises(ConfigError, match="未知 section「not-a-section」"):
+        load_config(path)
+
+
+def test_sandbox_extra_read_path_must_be_absolute(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    text = EXAMPLE.read_text(encoding="utf-8").replace(
+        "# extra_read_paths = [\"/opt/local/share\"]\n",
+        'extra_read_paths = ["relative/path"]\n',
+        1,
+    )
+    path = tmp_path / "config.toml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigError, match="extra_read_paths"):
+        load_config(path)
+
+
+def test_unknown_sandbox_key_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    text = EXAMPLE.read_text(encoding="utf-8").replace(
+        "[deepseek.sandbox]\n",
+        "[deepseek.sandbox]\nmode = \"loose\"\n",
+        1,
+    )
+    path = tmp_path / "config.toml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"deepseek\.sandbox\.mode"):
         load_config(path)
 
 

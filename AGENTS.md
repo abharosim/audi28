@@ -17,7 +17,7 @@ audi28 是本机的 agent 会话层和统一审批中心。用户通过 Audi（G
 
 - 用官方 Python SDK `deepseek-harness-sdk`，不要用 TypeScript 的 `client.onRequest` 签名。Python 侧是 `approval_requests=True`，并且必须用独立线程/循环调用 `client.next_request()`，与 `run()` 并发，再用 `client.respond(...)` 回答。用户提问走 `on_user_question`。
 - 一次允许只映射为 `allowed-once`，拒绝为 `rejected`，取消为 `cancelled`。不要实现「永久允许」。
-- 显式设置 `dsh_home`（`data/dsh-home`）。SDK 不会去发现 `~/.dsh`。
+- 显式设置 `dsh_home`（`data/dsh-home`）。SDK 不会去发现 `~/.dsh`。macOS 上通过 SDK 的 `dsh_bin` 挂一个 `sandbox-exec` 包装脚本，不改 SDK 内部。没有 `sandbox-exec` 时 WARN 并继续。
 - `resume_session` 失败时不要静默另建 session。它也不会恢复 shell / browser 等外部进程。
 - 协议没有 session-close / 取消 turn 的 RPC。不要假装已经中止了正在跑的工具调用。
 

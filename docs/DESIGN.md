@@ -456,7 +456,7 @@ webhook 体（audi28 → Audi）：
 - Phase 1 不对写文件、shell、插件安装、git、工作区以外的路径做 auto-approve。
 - 默认权限预设是 `workspace-write`。加载时只接受 `read-only` 和 `workspace-write`，拒绝 `danger-full-access`。工具调用仍要经过审批。workspace 默认是 `~/Code/deepseek-workspace`，写在 `config.toml` 里；加载时把 `~` 展开成绝对路径。没写、或写成相对路径，都是配置错误，不会悄悄改用 `$HOME` 下的另一个目录。
 - 日志和事件做 redact（URL、key）。inbox 不跟随 symlink。
-- DeepSeek 的 `dsh_home` 隔离在项目 `data/` 下。
+- DeepSeek 的 `dsh_home` 隔离在项目 `data/` 下。macOS 上用 `sandbox-exec` 套住 `dsh`：默认允许，拒绝家目录的读写，只放开工作区、`dsh_home`，以及读 `.venv` 和运行时文件。项目 `.env` 不给读，密钥走环境变量。SDK 0.2.2rc2 的入口是 `dsh_bin`，audi28 用一个包装脚本去调用 `sandbox-exec`。没有 `sandbox-exec` 时记 WARN 并继续。网络和系统目录（包括 `/tmp`）仍可读，这是残留风险。
 - 本机写 API（若仪表盘以后要批准按钮）必须要求 JSON、loopback Host，并拒绝跨站 `Sec-Fetch-Site`（对齐 audi27 的 `/api/confirm`）。
 
 ## 15. 目录布局（实现时）

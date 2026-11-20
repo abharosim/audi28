@@ -76,6 +76,8 @@ def test_inbox_task_writes_route_and_session_then_calls_backend(tmp_path):
     assert len(backend.starts) == 1
     assert len(backend.runs) == 1
     assert backend.runs[0].backend_session_id == backend.starts[0].handle
+    assert backend.runs[0].audi_session_id == sessions.list()[0].session_id
+    assert backend.runs[0].audi_session_id != backend.runs[0].backend_session_id
 
     restarted = SessionStore(sessions.directory)
     assert len(restarted.list()) == 1

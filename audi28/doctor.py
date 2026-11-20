@@ -20,6 +20,7 @@ from typing import Any
 from audi28.approval import ApprovalCenter
 from audi28.config import Config, ConfigError, load_config, load_dotenv
 from audi28.events import EventLog
+from audi28.sandbox import render_profile, sandbox_exec_path, self_test
 from audi28.sessions import SessionStore
 
 _SDK_NAME = "deepseek-harness-sdk"
@@ -95,6 +96,7 @@ def doctor_report(
     else:
         checks.extend(_dir_checks(config))
         checks.append(_workspace_check(config))
+        checks.append(_sandbox_check(config, env))
         checks.extend(_service_checks(config, probe))
         checks.append(_approvals_check(config))
         checks.append(_sessions_check(config))
@@ -289,6 +291,63 @@ def _workspace_check(config: Config) -> Check:
     if not path.is_dir() or not os.access(path, os.W_OK):
         return Check("workspace", "FAIL", f"{path} 不可写。", f"chmod u+w {path}")
     return Check("workspace", "PASS", f"{path} 存在且可写。", "")
+
+
+def _sandbox_check(config: Config, env: Mapping[str, str]) -> Check:
+    if not config.deepseek.sandbox.enabled:
+        return Check("sandbox", "PASS", "沙箱未启用。macOS 上不写这项时默认启用。", "")
+    binary = sandbox_exec_path()
+    profile = config.root / "data" / "sandbox" / "deepseek.sb"
+    if binary is None:
+        return Check(
+            "sandbox",
+            "WARN",
+            "配置开了沙箱，但这台系统没有 sandbox-exec，运行时不会被套住。",
+            "在 macOS 上跑。没有 sandbox-exec 时只记 WARN，继续启动。",
+        )
+    home = Path(env.get("HOME") or str(Path.home())).expanduser()
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    profile.write_text(
+        render_profile(
+            home=home,
+            workspace=config.deepseek.workspace,
+            dsh_home=config.deepseek.dsh_home,
+            project_root=config.root,
+            extra_read_paths=config.deepseek.sandbox.extra_read_paths,
+            sandbox_dir=profile.parent,
+        ),
+        encoding="utf-8",
+    )
+    canary = home / f".audi28-sandbox-canary-{os.getpid()}"
+    sample = config.deepseek.workspace / f".audi28-sandbox-ok-{os.getpid()}"
+    try:
+        canary.write_text("audi28-canary\n", encoding="utf-8")
+        sample.parent.mkdir(parents=True, exist_ok=True)
+        sample.write_text("workspace-ok\n", encoding="utf-8")
+        denied, allowed = self_test(profile, canary, sample)
+    except OSError as exc:
+        return Check(
+            "sandbox",
+            "FAIL",
+            f"自测没能准备临时文件：{exc.__class__.__name__}。profile 在 {profile}。",
+            "确认家目录和工作区可写。",
+        )
+    finally:
+        canary.unlink(missing_ok=True)
+        sample.unlink(missing_ok=True)
+    if denied and allowed:
+        return Check(
+            "sandbox",
+            "PASS",
+            f"沙箱生效。profile 在 {profile}。家目录探针被拒绝，工作区文件可以读。",
+            "",
+        )
+    return Check(
+        "sandbox",
+        "FAIL",
+        f"自测没通过（家目录拒绝={denied}，工作区可读={allowed}）。profile 在 {profile}。",
+        "检查 profile 里家目录的 deny 在工作区 allow 之前。",
+    )
 
 
 def _dir_checks(config: Config) -> list[Check]:

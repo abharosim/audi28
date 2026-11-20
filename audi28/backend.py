@@ -14,7 +14,7 @@ class Backend(Protocol):
     def start(self, session_id: str, text: str) -> str:
         """Open a backend session and return its handle."""
 
-    def run(self, backend_session_id: str, text: str) -> None:
+    def run(self, backend_session_id: str, text: str, *, audi_session_id: str | None = None) -> None:
         """Send a follow-up to an existing backend session."""
 
 
@@ -29,6 +29,7 @@ class StartCall:
 class RunCall:
     backend_session_id: str
     text: str
+    audi_session_id: str | None = None
 
 
 class FakeBackend:
@@ -43,8 +44,14 @@ class FakeBackend:
         self.starts.append(StartCall(session_id=session_id, text=text, handle=handle))
         return handle
 
-    def run(self, backend_session_id: str, text: str) -> None:
-        self.runs.append(RunCall(backend_session_id=backend_session_id, text=text))
+    def run(self, backend_session_id: str, text: str, *, audi_session_id: str | None = None) -> None:
+        self.runs.append(
+            RunCall(
+                backend_session_id=backend_session_id,
+                text=text,
+                audi_session_id=audi_session_id,
+            )
+        )
 
 
 class UnconnectedBackend:
@@ -54,6 +61,6 @@ class UnconnectedBackend:
         del session_id, text
         return ""
 
-    def run(self, backend_session_id: str, text: str) -> None:
-        del backend_session_id, text
+    def run(self, backend_session_id: str, text: str, *, audi_session_id: str | None = None) -> None:
+        del backend_session_id, text, audi_session_id
         return None

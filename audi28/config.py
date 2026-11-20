@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +58,14 @@ class SessionsConfig:
 
 
 @dataclass(frozen=True)
+class SandboxConfig:
+    """macOS seatbelt around the DeepSeek runtime. Off by default elsewhere."""
+
+    enabled: bool
+    extra_read_paths: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
 class DeepSeekConfig:
     enabled: bool
     profile: str
@@ -67,6 +76,7 @@ class DeepSeekConfig:
     permission_mode: str
     approval_requests: bool
     initialize_timeout_seconds: float
+    sandbox: SandboxConfig
     reasoning_effort: str | None = None
     max_tokens: int | None = None
 
@@ -125,7 +135,7 @@ _SPECS: dict[str, tuple[set[str], set[str]]] = {
             "approval_requests",
             "initialize_timeout_seconds",
         },
-        {"reasoning_effort", "max_tokens"},
+        {"reasoning_effort", "max_tokens", "sandbox"},
     ),
     "approval": (set(), {"remind_after_s"}),
     "hooks": ({"enabled", "token_env"}, set()),
@@ -304,9 +314,44 @@ def _deepseek(table: Mapping[str, object], root: Path) -> DeepSeekConfig:
             "initialize_timeout_seconds",
             table["initialize_timeout_seconds"],
         ),
+        sandbox=_sandbox(table.get("sandbox"), root),
         reasoning_effort=reasoning,
         max_tokens=max_tokens,
     )
+
+
+def _sandbox(value: object, root: Path) -> SandboxConfig:
+    if value is None:
+        return SandboxConfig(enabled=sys.platform == "darwin", extra_read_paths=())
+    if not isinstance(value, dict):
+        raise ConfigError("deepseek.sandbox 必须是一张表。")
+    unknown = sorted(set(value) - {"enabled", "extra_read_paths"})
+    if unknown:
+        raise ConfigError(f"未知配置项 deepseek.sandbox.{unknown[0]}。")
+    if "enabled" in value:
+        enabled = _require_bool("deepseek.sandbox", "enabled", value["enabled"])
+    else:
+        enabled = sys.platform == "darwin"
+    raw_paths = value.get("extra_read_paths", [])
+    if not isinstance(raw_paths, list):
+        raise ConfigError("deepseek.sandbox.extra_read_paths 必须是路径列表。")
+    paths: list[Path] = []
+    for item in raw_paths:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError("deepseek.sandbox.extra_read_paths 必须是路径列表。")
+        text = item.strip()
+        if text.startswith("~"):
+            expanded = Path(text).expanduser()
+        else:
+            expanded = Path(text)
+        if not expanded.is_absolute():
+            raise ConfigError(
+                "deepseek.sandbox.extra_read_paths 必须是绝对路径，或用 ~ 开头。"
+                f"不接受 {text}。"
+            )
+        paths.append(expanded.resolve())
+    del root
+    return SandboxConfig(enabled=enabled, extra_read_paths=tuple(paths))
 
 
 def _approval(table: Mapping[str, object]) -> ApprovalConfig:
