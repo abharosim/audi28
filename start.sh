@@ -29,4 +29,8 @@ raise SystemExit(0 if isinstance(deepseek, dict) and deepseek.get("enabled") is 
   extra+=(--extra deepseek)
 fi
 
-exec uv run "${extra[@]}" audi28 supervise "$@"
+# Bash 3.2 on macOS treats "${extra[@]}" as unbound when the array is empty.
+if [[ ${#extra[@]} -gt 0 ]]; then
+  exec uv run "${extra[@]}" audi28 supervise "$@"
+fi
+exec uv run audi28 supervise "$@"
