@@ -47,22 +47,24 @@ class Inbox:
         self._secrets = tuple(secret for secret in secrets if secret)
         self._seen_ids, self._seen_keys = _seen_from_events(events)
 
-    def poll_once(self) -> None:
+    def poll_once(self) -> list[dict[str, Any]]:
+        accepted: list[dict[str, Any]] = []
         self._ensure_dirs()
         with _thread_lock(self.root), self._decision_lock():
             self._refresh_seen()
             leftovers = _json_files(self.processing)
             incoming = _json_files(self.root)
             for path in leftovers:
-                self._accept_one(path)
+                self._accept_one(path, accepted)
             for path in incoming:
-                self._accept_one(path)
+                self._accept_one(path, accepted)
+        return accepted
 
     def _ensure_dirs(self) -> None:
         for directory in (self.root, self.processing, self.processed, self.quarantine):
             directory.mkdir(parents=True, exist_ok=True)
 
-    def _accept_one(self, path: Path) -> None:
+    def _accept_one(self, path: Path, accepted: list[dict[str, Any]]) -> None:
         claimed = self._claim(path)
         if claimed is None:
             return
@@ -76,7 +78,7 @@ class Inbox:
         if size > self._max_bytes:
             self._quarantine(claimed, "too-large")
             return
-        self._finish_one(claimed)
+        self._finish_one(claimed, accepted)
 
     def _claim(self, path: Path) -> Path | None:
         destination = self.processing / f"{uuid.uuid4().hex}-{path.name}"
@@ -92,7 +94,7 @@ class Inbox:
                 pass
         return destination
 
-    def _finish_one(self, path: Path) -> None:
+    def _finish_one(self, path: Path, accepted: list[dict[str, Any]]) -> None:
         try:
             obj = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError, FileNotFoundError):
@@ -127,6 +129,7 @@ class Inbox:
         self._seen_ids.add(message_id)
         if idempotency_key is not None:
             self._seen_keys.add(idempotency_key)
+        accepted.append(obj)
         self._move(path, self.processed)
 
     def _fail_parse(self, path: Path) -> None:

@@ -11,6 +11,7 @@ from pathlib import Path
 from audi28.config import Config, ConfigError, prepare
 from audi28.doctor import doctor_report
 from audi28.events import EventLog, EventLogError
+from audi28.sessions import SessionNotFound, SessionStore
 from audi28.supervisor import supervise
 from audi28.transport import Outbox
 
@@ -30,6 +31,11 @@ def main(argv: list[str] | None = None) -> int:
     grokbot = sub.add_parser("grokbot", help="talk to the Grok Bot webhook")
     grokbot_sub = grokbot.add_subparsers(dest="grokbot_command", required=True)
     grokbot_sub.add_parser("test", help="send one test message through the outbox")
+    sessions = sub.add_parser("sessions", help="list or close audi28 sessions")
+    sessions_sub = sessions.add_subparsers(dest="sessions_command", required=True)
+    sessions_sub.add_parser("list", help="list sessions that are not closed")
+    close = sessions_sub.add_parser("close", help="close one session")
+    close.add_argument("session_id")
 
     args = parser.parse_args(_normalize_argv(argv))
     config_path = args.config or (Path.cwd() / "config.toml")
@@ -49,6 +55,8 @@ def main(argv: list[str] | None = None) -> int:
         return _replay(config.root / "data" / "events")
     if args.command == "grokbot":
         return _grokbot_test(config)
+    if args.command == "sessions":
+        return _sessions_command(config, args.sessions_command, getattr(args, "session_id", None))
     supervise(config)
     return 0
 
@@ -80,6 +88,24 @@ def _normalize_argv(argv: list[str] | None) -> list[str] | None:
     if not config:
         return rest
     return config + rest
+
+
+def _sessions_command(config: Config, command: str, session_id: str | None) -> int:
+    store = SessionStore(config.root / "data" / "sessions")
+    if command == "list":
+        for record in store.list():
+            print(json.dumps(record.as_dict(), ensure_ascii=False))
+        return 0
+    if not session_id:
+        print("要关闭的 session_id 不能空。", file=sys.stderr)
+        return 1
+    try:
+        store.close(session_id)
+    except SessionNotFound:
+        print("没有这个 session。", file=sys.stderr)
+        return 1
+    print("已关闭。")
+    return 0
 
 
 def _grokbot_test(config: Config) -> int:

@@ -47,6 +47,8 @@ class RouteConfig:
     llm: bool
     default: str
     new_task_phrases: tuple[str, ...]
+    not_new_task_phrases: tuple[str, ...]
+    self_phrases: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -100,7 +102,10 @@ _SPECS: dict[str, tuple[set[str], set[str]]] = {
     "events": (set(), set()),
     "inbox": ({"poll_s", "parse_retries", "max_bytes"}, set()),
     "grokbot": ({"header_name", "header_value", "timeout_s"}, set()),
-    "route": ({"llm", "default", "new_task_phrases"}, set()),
+    "route": (
+        {"llm", "default", "new_task_phrases", "not_new_task_phrases", "self_phrases"},
+        set(),
+    ),
     "sessions": ({"idle_timeout_s"}, set()),
     "deepseek": (
         {
@@ -228,21 +233,33 @@ def _grokbot(table: Mapping[str, object]) -> GrokbotConfig:
 
 def _route(table: Mapping[str, object]) -> RouteConfig:
     default = _require_str("route", "default", table["default"])
-    if default not in {"deepseek", "self"}:
-        raise ConfigError("route.default 只能是 deepseek 或 self。")
-    phrases = table["new_task_phrases"]
-    if not isinstance(phrases, list) or not phrases:
-        raise ConfigError("route.new_task_phrases 必须是非空字符串列表。")
-    cleaned: list[str] = []
-    for phrase in phrases:
-        if not isinstance(phrase, str) or not phrase.strip():
-            raise ConfigError("route.new_task_phrases 必须是非空字符串列表。")
-        cleaned.append(phrase.strip())
+    if default == "self":
+        default = "audi_self"
+    if default not in {"deepseek", "audi_self"}:
+        raise ConfigError("route.default 只能是 deepseek 或 audi_self。")
     return RouteConfig(
         llm=_require_bool("route", "llm", table["llm"]),
         default=default,
-        new_task_phrases=tuple(cleaned),
+        new_task_phrases=_phrase_list("route", "new_task_phrases", table["new_task_phrases"], allow_empty=False),
+        not_new_task_phrases=_phrase_list(
+            "route",
+            "not_new_task_phrases",
+            table["not_new_task_phrases"],
+            allow_empty=True,
+        ),
+        self_phrases=_phrase_list("route", "self_phrases", table["self_phrases"], allow_empty=True),
     )
+
+
+def _phrase_list(section: str, key: str, value: object, *, allow_empty: bool) -> tuple[str, ...]:
+    if not isinstance(value, list) or (not value and not allow_empty):
+        raise ConfigError(f"{section}.{key} 必须是字符串列表。")
+    cleaned: list[str] = []
+    for phrase in value:
+        if not isinstance(phrase, str) or not phrase.strip():
+            raise ConfigError(f"{section}.{key} 必须是字符串列表。")
+        cleaned.append(phrase.strip())
+    return tuple(cleaned)
 
 
 def _sessions(table: Mapping[str, object]) -> SessionsConfig:
