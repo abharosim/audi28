@@ -12,20 +12,23 @@ audi28 是独立项目，放在 `~/Code/audi28`，和 `~/Code/audi27` 并列。�
 
 ## 现状
 
-目前只有设计文档，还没有实现。实现会按 `docs/DESIGN.md` 里的 PR 步骤进行。
-
-计划中的启动方式（实现之后）：
+骨架已经在仓库里：`config.toml` 加载（未知 section 会报错）、append-only JSONL 事件、CLI（`events`、`supervise`、`web`、`doctor`）、`start.sh` 拉起只监听 `127.0.0.1:8728` 的占位仪表盘。传输、router、session 存储、DeepSeek adapter 和审批中心还没做。
 
 ```bash
+uv sync --extra dev
 cp config.example.toml config.toml
-# 在 .env 里放 AUDI28_GROKBOT_WEBHOOK_URL、AUDI28_GROKBOT_WEBHOOK_KEY、DEEPSEEK_API_KEY
+# .env 里以后放 AUDI28_GROKBOT_WEBHOOK_URL、AUDI28_GROKBOT_WEBHOOK_KEY、DEEPSEEK_API_KEY
+# 密钥还没提供也可以。doctor 会说明怎么补，不会崩溃。
+uv run pytest
+uv run audi28 doctor
 ./start.sh
 # 仪表盘：http://127.0.0.1:8728
-# 重启：touch data/restart.request
 ```
 
-传输：Audi 不能访问本机 HTTP。任务和审批决定写成 `data/inbox/audi/*.json`；audi28 用 webhook 把结果和「DeepSeek 在问你：…」推回 Audi。这条路径需要一条只覆盖该 inbox 目录的 Allow rule，见设计文档。
+传输：Audi 不能访问本机 HTTP。任务和审批决定写成 `data/inbox/audi/*.json`。Ruoran 已批准 Audi 把 JSON 写入 `~/Code/audi28/data/inbox/audi/`（目录不存在可以建），其它 Mac 写入仍要单独批准。audi28 用 webhook 把结果和「DeepSeek 在问你：…」推回 Audi。
+
+DeepSeek 的默认工作区是 `~/Code/deepseek-workspace`（可在 `config.toml` 里改），权限预设是 `workspace-write`。工具调用仍要审批。用户没有明确说要新任务时，继续最近一个仍开放的 session。审批和提问没有超时自动拒绝，一直等到回答。
 
 ## 许可证与密钥
 
-不要把 API key 或 webhook 密钥写进 `config.toml` 或仓库。用项目根目录的 `.env`（gitignore）。
+不要把 API key 或 webhook 密钥写进 `config.toml` 或仓库。用项目根目录的 `.env`（gitignore），或导出到环境变量。`DEEPSEEK_API_KEY` 由 Ruoran 稍后提供。没有这把密钥时，进程不崩溃；`audi28 doctor` 会说明把密钥写进 `~/Code/audi28/.env` 或环境变量。

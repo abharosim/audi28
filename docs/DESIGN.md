@@ -1,8 +1,8 @@
 # audi28 设计文档
 
-> 状态：设计稿，尚未实现。实现放在后续步骤。
-> 日期：2026-11-19（America/New_York）。
-> 项目位置（实现时）：Mac 上 `~/Code/audi28`，与 `~/Code/audi27` 并列。本文稿先写在 box 的 `/workspace/audi28/`，经 Ruoran 批准后再拷过去。
+> 状态：2026-11-20 的决定已写入正文。Phase 1 的骨架（配置、事件日志、CLI、占位仪表盘）已在本仓库；传输、router、session 存储、DeepSeek adapter、审批中心尚未实现。
+> 日期：2026-11-19 起草（America/New_York），2026-11-20 按 Ruoran 的决定改定。
+> 项目位置：Mac 上 `~/Code/audi28`，与 `~/Code/audi27` 并列。本仓库就是这份实现。
 
 ## 1. 背景与文档来源
 
@@ -72,7 +72,9 @@ audi28 是**独立服务**。两者可以同机并列运行，通过文件或本
 
 说明：DaDa 文档和 TypeScript 示例用的是 `client.onRequest(...)`。Python 镜像同一套协议，但公开 API 是 `next_request()` + `respond()`，外加独立的 `on_user_question`。audi28 按 Python API 写，不要照抄 TS 回调签名。
 
-Phase 1 建议用完整 `sdk` profile（需要权限预设），`dsh_home` 放在项目下的 `data/dsh-home`，不要用 `~/.dsh`。默认权限 `workspace-write`，并打开 `approval_requests`，这样写操作仍要经过审批中心。不要在 Phase 1 使用 `danger-full-access` 或 headless 的 `--approval-policy never`。
+Phase 1 用完整 `sdk` profile（需要权限预设），`dsh_home` 放在项目下的 `data/dsh-home`，不要用 `~/.dsh`。默认权限 `workspace-write`，并打开 `approval_requests`，这样写操作仍要经过审批中心。不要在 Phase 1 使用 `danger-full-access` 或 headless 的 `--approval-policy never`。
+
+默认 workspace 是 `~/Code/deepseek-workspace`，写在 `config.toml` 的 `[deepseek] workspace`，可以改成另一个目录。加载配置时把 `~` 展开成绝对路径。没写 workspace，或写成相对路径，都是配置错误，不会悄悄改用 `$HOME` 下的别的目录。`workspace-write` 只划定 DeepSeek 能碰到的目录；每一次工具调用仍然进入审批中心。
 
 ## 5. 架构
 
@@ -112,10 +114,10 @@ flowchart TB
 | `config` | 加载 `config.toml` + `.env`，未知 section 要报错（audi27 的教训） | 做 |
 | `events` | append-only JSONL，字段与 audi27 一致：`id, ts, type, source, ref, data`。不认识的 type 照样保存 | 做 |
 | `transport` | 看 inbox；向 Grok Bot webhook 发消息；把文件移到 `processed/` 或 `quarantine/` | 做 |
-| `router` | 可插拔接口。规则引擎先做；可选 LLM 以后再加。产出 `deepseek` 或 `self` | 做（仅规则） |
+| `router` | 可插拔接口。规则引擎先做；可选 LLM 以后再加。产出 `deepseek` 或 `self`，以及继续 session 还是新开，并带 `reason`。写入 `route` 事件 | 做（仅规则） |
 | `sessions` | audi28 `session_id` ↔ backend + backend session id；持久化；list / close / 过期 | 做 |
 | `adapters.deepseek` | 启动/复用 Harness，`run` / `resume_session`，并发排空 `next_request`，挂上 `on_user_question` | 做 |
-| `approval` | 规范化 `ApprovalRequest` / `ApprovalDecision`，pending、超时、幂等、审计事件 | 做 |
+| `approval` | 规范化 `ApprovalRequest` / `ApprovalDecision`。pending 一直等到用户回答，不自动拒绝；重启后仍在，可再次提醒；幂等、审计事件 | 做 |
 | `format` | 生成带来源标签、适合口述的中文 | 做 |
 | `web` | 本机仪表盘：session、待审批、最近事件 | 做（只读为主） |
 | `supervisor` / `cli` / `doctor` | 启停、健康检查（SDK 是否安装、`dsh_home`、密钥是否存在、inbox 是否可写、kws 式的 liveness 可省略） | 做 |
@@ -146,7 +148,9 @@ workflow：
 
 webhook 与 audi27 **分开**：专用 routine，提示词知道 session、来源标签、以及要把 `session_id` / `request_id` 原样写回。不要复用 `AUDI27_GROKBOT_*`，以免两条产品线抢同一个 inbox。
 
-需要向 Ruoran 申请的 Allow rule（未经同意不要扩大范围）：
+### Allow rule（2026-11-20 已批准）
+
+Ruoran 已同意下面这一条，且只同意这一条。实现时不要扩大写入范围：
 
 > Allow Audi to copy JSON files from its box into `~/Code/audi28/data/inbox/audi/` on my Mac (machine 806b8af2), creating that folder if needed, without asking; any other write on my Mac still needs my approval.
 
@@ -157,34 +161,50 @@ webhook 与 audi27 **分开**：专用 routine，提示词知道 session、来�
 - audi28 自己生成 `session_id`（例如 `ses-<uuid>`），不要直接拿 DeepSeek 的 id 当对外 id，方便以后一个会话模型下挂多个 backend。
 - 映射表持久化在 `data/sessions/<session_id>.json`，并写 `session` 事件。重启后以文件为准，事件可重建。
 - 每条记录至少包含：`session_id`、`backend`（Phase 1 只有 `deepseek`）、`backend_session_id`、`workspace`、`status`（`open` / `idle` / `running` / `closed` / `error`）、`created_ts`、`updated_ts`、`last_task_id`、`title`（可从首条任务截断）。
-- 新任务：router 选 `deepseek` 后创建 session，调用 `harness.run(..., session_id=backend_session_id)`。把两个 id 都写进发给 Audi 的结果，Audi 必须在后续消息里带回 `session_id`。
+- 开新 session 还是继续上一个，由 router 决定，见第 9 节。决定成新 session 之后，调用 `harness.run(..., session_id=backend_session_id)`。把两个 id 都写进发给 Audi 的结果。Audi 可以在后续消息里带回 `session_id`；没带回、也没明确要新任务时，仍然继续最近一个仍开放的 session。
 - 同一 session 的跟进：若 DeepSeek 运行时还在，直接 `session.run(text)`；若进程刚重启，先 `resume_session(backend_session_id)` 再 `run`。`dsh_home` 和 workspace 必须与创建时相同。
 - 多个 session 可以并存。推荐一个长期存活的 `DeepSeekHarness`。官方说明 `run()` 可以重叠且不会互相吃掉结果；Phase 1 仍按 session **串行** 执行（每个 session 一个队列），避免审批和提问交错难理。不同 session 之间可以并行，若实现成本高，MVP 先全局串行也行，在代码里留出队列边界。
 - 关闭：用户或 Audi 发 `kind: close_session`。audi28 把状态标为 `closed`，不再接受新输入。协议没有 session-close RPC，关闭时不必杀掉整个运行时（以免牵连其它 session）。放弃一轮进行中的 turn，官方做法是关掉运行时进程——Phase 1 只支持「取消待审批」（回 `cancelled` / `{cancelled:true}`），不保证能中止已经在跑的工具。这一点要在 `doctor` 和文档里写清楚。
 - 过期：`[sessions] idle_timeout_s`（建议默认 24 小时无新消息则标 `idle`，不自动关闭，避免误杀）。`closed` 的不再 resume。列出时默认隐藏已关闭的。
-- 跟进但没带 `session_id`：如果恰好有一个 `open`/`idle` 且在 `sticky_s`（建议 6 小时）内活跃的 session，就用它；否则开新 session，并在回复里说明。这条策略是开放问题，见文末。
-- 运行时重启后，尚未回答的 `user-question` request id 失效。审批中心把它们标为 `expired`，webhook 通知 Audi「DeepSeek 的提问已失效，需要重说一遍」。
+- 没明确要新任务时，继续最近一个仍开放的 session，不看 6 小时窗口，也不要求「恰好只有一个」。`idle` 只是标记，不因此另开 session。细节和 `reason` 见第 9 节。
+- 运行时重启后，官方限制是：尚未回答的 `user-question` request id 不能再提交。audi28 不因此自动拒绝，也不把这条提问标成过期后丢掉。pending 留在事件里，重启后还在，仪表盘上看得到，并会再次告诉 Audi。用户回答之后，如果当时的 runtime 已经不收这个 request id，就把回答记下来，说明这次送不回去，请 DeepSeek 再问一次。不假装已经回答了运行时。
 
 ## 9. Routing
 
 ```python
 class Router:
-    def decide(self, message: TaskMessage) -> RouteDecision:
+    def decide(self, message: TaskMessage, context: RouteContext) -> RouteDecision:
         ...
 
-# RouteDecision: {target: "deepseek" | "self", reason: str, rule_id: str | None}
+# RouteDecision:
+#   target: "deepseek" | "self"
+#   session_action: "continue" | "new" | "none"
+#   session_id: str | None
+#   reason: str          # 必填。人能看懂为什么是这个决定
+#   rule_id: str | None
 ```
 
-Phase 1 只用规则，配置在 `routes.toml`（或 `config.toml` 的 `[route.rules]`）。建议顺序：
+每一次判断都追加一条 `route` 事件：`source` 为 `router`，`ref` 为 inbox 的 `message_id`，`data` 就是上面的 `RouteDecision`。不认识的 `type` 仍照常保存；`route` 只是建议类型之一。
+
+Phase 1 只用规则，配置在 `config.toml` 的 `[route]`。规则先做。以后可以把 LLM 判断插进同一个接口：它能看更宽的上下文；超时或解析失败就回到下面这套规则，不另开一条状态机。
+
+先决定交给谁：
 
 1. 显式：用户或 Audi 指定 backend（`target: deepseek`）——直接采用。
 2. 显式自答：「你直接回答」「不用 DeepSeek」等 → `self`。
 3. 关键词 / 模式：改代码、跑测试、看仓库、写 patch 等 → `deepseek`。
 4. 默认：已经进了 audi28 inbox 的消息，默认 `deepseek`（Audi 的第一层过滤应当已经把闲聊拦下）。仍要写出 `reason`。
 
-`self` 的意思是：**不要**开 DeepSeek session。audi28 向 Audi webhook 回 `kind: self`，请 Audi 用自己的能力回答。Audi 在第一层也可以根本不写 inbox。两层都做判断，是为了 Audi 误放行时还能拦下来，并留下审计。
+`self` 的意思是：**不要**开 DeepSeek session，也不要去继续一个。`session_action` 为 `none`，`session_id` 为 null。audi28 向 Audi webhook 回 `kind: self`，请 Audi 用自己的能力回答。Audi 在第一层也可以根本不写 inbox。两层都做判断，是为了 Audi 误放行时还能拦下来，并留下审计。
 
-以后加 LLM router 时实现同一个接口，超时或解析失败则回退到规则默认值（与 audi27 `[route] llm` 的思路相同）。
+`target` 是 `deepseek` 时，再决定 session。默认是**继续**最近一个仍开放的 session。只有用户明确说要新任务时才另开。Phase 1 的规则看任务正文，不靠计时窗口：
+
+1. 正文包含 `[route] new_task_phrases` 里的一条（默认 `新任务`、`开一个新的`、`new task`）→ `session_action=new`，`session_id=null`。比较时按子串，忽略首尾空白，只对 ASCII 字母忽略大小写。`reason` 写明命中了哪一条。这句话优先于消息里带来的旧 `session_id`。
+2. 否则，消息带了 `session_id` → `session_action=continue`，就用这个 id，不要改去最近的另一个。`reason` 写明是消息点名的 session。这个 id 已经 `closed` 时也仍然给出 `continue` 和这个 id，并在 `reason` 里写明它已关闭；session 层拒绝这轮输入，不要悄悄另开一个来顶替。
+3. 否则，继续最近更新的仍开放 session（`open` / `idle` / `running`，按 `updated_ts`）。`closed` 和 `error` 不在此列。有好几个时用最近的那个，不要求恰好只有一个。`reason` 写明「没有新任务说法，继续最近一个仍开放的 session」。
+4. 一个可继续的 session 都没有 → `session_action=new`。`reason` 写明是因为没有仍开放的 session，而不是因为用户要求新任务。
+
+`idle_timeout_s` 只把长时间没消息的 session 标成 `idle`，不自动关闭，也不因此开新 session。不再使用 `sticky_s`。
 
 ## 10. 审批中心
 
@@ -210,8 +230,6 @@ Phase 1 只用规则，配置在 `routes.toml`（或 `config.toml` 的 `[route.r
   },
   "questions": null,
   "created_ts": "2026-11-19T22:10:00.000-05:00",
-  "timeout_s": 600,
-  "timeout_action": "deny",
   "idempotency_key": "deepseek:dsh-session-…:call-19"
 }
 ```
@@ -232,7 +250,7 @@ Phase 1 只用规则，配置在 `routes.toml`（或 `config.toml` 的 `[route.r
 }
 ```
 
-`decision` 为 `allow` | `deny` | `cancel`。`source` 为 `user` | `timeout` | `rule`。Phase 1 不提供 `rule` 自动放行破坏性操作；规则最多能 **deny**。
+`decision` 为 `allow` | `deny` | `cancel`。`source` 为 `user` | `rule`。没有 `timeout`：到点不会自己产生决定。Phase 1 不提供 `rule` 自动放行破坏性操作；规则最多能 **deny**。
 
 映射到 DeepSeek：
 
@@ -241,13 +259,18 @@ Phase 1 只用规则，配置在 `routes.toml`（或 `config.toml` 的 `[route.r
 | `allow` | `{outcome: "allowed-once"}` | 按 `answers` 填每个问题 id（用户选了选项或自定义文本） |
 | `deny` | `{outcome: "rejected"}` | 没有合适映射时用 `{cancelled: true}`，并在事件里标明这是拒绝而非用户关闭 |
 | `cancel` | `{outcome: "cancelled"}` | `{cancelled: true}` |
-| 超时（默认 deny） | `rejected` | `{cancelled: true}` |
+
+没有超时这一行。pending 不因为等太久而变成 `rejected` 或 `{cancelled: true}`。
 
 Claude Code / Codex 以后映射为 hook 的 `allow` / `deny`（可选 `message`）。注意 DeepSeek 的允许是一次性的 `allowed-once`，不要在用户文案里说成「以后都允许」。
 
-状态：`pending` → `decided` | `expired` | `cancelled_by_backend`。同一 `idempotency_key` 已有 pending 则复用；已有终态则不再问用户，并把原决定返回给 backend（若 backend 仍在等）。官方说取消后迟到的回复会被丢掉；重启后的提问 id 不可再用。
+状态：`pending` → `decided` | `cancelled_by_backend`。同一 `idempotency_key` 已有 pending 则复用；已有终态则不再问用户，并把原决定返回给 backend（若 backend 仍在等）。官方说取消后迟到的回复会被丢掉。连接断开时，DeepSeek 侧可能已经把这次请求 fail closed；那是运行时的行为。audi28 自己不补一条 deny。若确认 backend 已取消，状态记为 `cancelled_by_backend`，并告诉 Audi。
 
-超时默认 600 秒（与 Claude Code HTTP hook 默认等待一致），`timeout_action = deny`（fail closed）。仪表盘可显示倒计时，但不提供「一键永久允许」。
+审批和提问一直等到用户回答。配置里没有 `timeout_s`，也没有 `timeout_action`。不要把 600 秒写回来。pending 追加为事件，重启时从事件日志重建还没有决定的条目。启动时对每一条再发一次 webhook（`reminder: true`），仪表盘列出它们。提醒发不出去也保持 `pending`，不改成 deny。仪表盘不提供「一键永久允许」。
+
+Claude Code 自己的 HTTP hook 默认最多等 600 秒，Codex 示例脚本里的 curl 也写了 `--max-time 600`（见 sources 文档）。那是那些工具的外部上限，不是 audi28 的策略。audi28 不会到点发 deny。Phase 2/3 接上它们时要单独处理这个外部上限。
+
+`user-question` 的 request id 在 DeepSeek 运行时重启后不能再提交。这不把 pending 自动清掉。处理方式见第 8 节：条目留在仪表盘，用户的回答要记下来；送不回去就说实话，请 DeepSeek 再问一次。
 
 每条请求和决定都追加事件，作为审计日志。密钥、完整绝对路径、环境变量不要进 `summary`，可留在仅供本机查看的 `detail`（仪表盘默认折叠，口述时不用）。
 
@@ -261,13 +284,15 @@ Audi 发出去的口语/聊天文本由 audi28 在 webhook 的 `spoken_text`（�
 - 用户提问：「DeepSeek 在问你：计划是先跑测试再提交。要按这个计划继续吗？」若有选项，逐条读出来，不要读路径。
 - 完成：「DeepSeek 说：测试已经通过，改动还没提交。」
 - 自答回退：「这条我建议自己回答，没有交给 DeepSeek。」
-- 失效：「DeepSeek 刚才那条提问已经失效，需要的话让它重新问一次。」
+- 送不回运行时：「DeepSeek 刚才那条提问已经送不回去了。需要的话让它重新问一次。」
 
 `spoken_text` 里禁止出现文件系统路径、URL、token。完整细节只放在 `text` / 仪表盘，供用户看屏幕时使用。
 
 ## 12. 消息流
 
-### (a) 新任务
+### (a) 明确要新任务
+
+下面是用户明确说出新任务（例如「新任务」）时的路径。没说新任务时走 (b)，即使 inbox 里的 `session_id` 是 null。
 
 ```mermaid
 sequenceDiagram
@@ -279,11 +304,11 @@ sequenceDiagram
   participant D as DeepSeek Harness
   participant W as webhook
 
-  U->>A: 帮我让 DeepSeek 在项目里跑测试
+  U->>A: 新任务：帮我让 DeepSeek 在项目里跑测试
   A->>A: 第一层：这是 agent 任务
   A->>I: kind=task, text=..., session_id=null
   I->>R: 读取文件
-  R->>R: 规则：target=deepseek
+  R->>R: target=deepseek，session_action=new（命中「新任务」）
   R->>S: 创建 ses-…
   S->>D: run(text, session_id=backend_id)
   D-->>S: final_response
@@ -292,7 +317,9 @@ sequenceDiagram
   A->>U: 转述 DeepSeek 的结果（可带 session 已建立）
 ```
 
-### (b) 同一 session 的跟进
+### (b) 继续最近一个 session
+
+用户没有明确要新任务。Audi 可以带上 `session_id`，也可以不带。router 写下 `session_action=continue` 和 `reason`。图里的 `ses-…` 是这条决定选出的 session。
 
 ```mermaid
 sequenceDiagram
@@ -343,7 +370,7 @@ sequenceDiagram
     P->>D: answers 或 cancelled
   end
   D-->>P: 继续跑完 turn
-  Note over P,A: 若 600 秒内没有决定：按 timeout_action=deny 回 rejected / cancelled，并通知 Audi
+  Note over P,A: 没有超时自动拒绝。pending 一直留到用户回答；重启后仍在，再次通知 Audi，并显示在仪表盘上
 ```
 
 ## 13. 数据 schema 与事件
@@ -404,7 +431,7 @@ webhook 体（audi28 → Audi）：
 - 仪表盘和以后的 hook HTTP 只绑 `127.0.0.1`，不绑 `0.0.0.0`。
 - webhook 和（以后）hook 端点使用 token。Token 只来自环境变量 / `.env`。Claude Code 的 hook header 用 `allowedEnvVars`，不要把 token 写进仓库里的 `settings.json`。
 - Phase 1 不对写文件、shell、插件安装、git、工作区以外的路径做 auto-approve。
-- 默认权限预设是 `workspace-write`，不是 `danger-full-access`。workspace 默认是配置里的绝对路径，不隐式使用 `$HOME`。
+- 默认权限预设是 `workspace-write`，不是 `danger-full-access`。工具调用仍要经过审批。workspace 默认是 `~/Code/deepseek-workspace`，写在 `config.toml` 里；加载时把 `~` 展开成绝对路径。没写、或写成相对路径，都是配置错误，不会悄悄改用 `$HOME` 下的另一个目录。
 - 日志和事件做 redact（URL、key）。inbox 不跟随 symlink。
 - DeepSeek 的 `dsh_home` 隔离在项目 `data/` 下。
 - 本机写 API（若仪表盘以后要批准按钮）必须要求 JSON、loopback Host，并拒绝跨站 `Sec-Fetch-Site`（对齐 audi27 的 `/api/confirm`）。
@@ -415,13 +442,14 @@ webhook 体（audi28 → Audi）：
 ~/Code/audi28/                 # 与 audi27 并列；本设计稿目前在 box 的 /workspace/audi28/
   README.md
   AGENTS.md
+  .gitignore
+  .github/workflows/ci.yml
   config.example.toml
   config.toml                  # 本地，gitignore
   .env                         # 本地，gitignore：AUDI28_GROKBOT_* 、DEEPSEEK_API_KEY
   pyproject.toml
   uv.lock
   start.sh
-  routes.example.toml
   docs/
     DESIGN.md
     sources/approval-hub-harness-interfaces.md
@@ -456,23 +484,23 @@ Phase 1 代码按上面拆模块，但每个 PR 只交能独立验证的一小�
 
 ### Phase 1 — 接通 DeepSeek（按 PR 拆分）
 
-**PR 1 — 骨架。** `pyproject.toml`（Python ≥ 3.10，uv）、`config` 加载器（未知 section 报错）、`events`（append / follow / replay，与 audi27 字段一致）、`cli`（`events`、`supervise`、`web`、`doctor` 占位）、`supervisor`、`start.sh`、`config.example.toml`。验收：`uv sync --extra dev` 后 `pytest` 通过；能 append 并 replay 一条事件；`start.sh` 能拉起 web 在 `127.0.0.1:8728`；伪造的未知 event type 被保存而不是丢弃。
+**PR 1 — 骨架。** `pyproject.toml`（Python ≥ 3.10，uv，dev extra 里有 pytest）、`config` 加载器（未知 section 报错）、`events`（append / follow / replay，与 audi27 字段一致）、`cli`（`events`、`supervise`、`web`、`doctor`）、`supervisor`、`start.sh`、`config.example.toml`、`.gitignore`（`.env`、`data/`、`.venv`）、GitHub Actions 跑 `pytest`。`doctor` 在缺少 `DEEPSEEK_API_KEY` 时说明怎么补，并且不崩溃；其它 doctor 检查仍留在 PR 6。验收：`uv sync --extra dev` 后 `pytest` 通过；能 append 并 replay 一条事件；`start.sh` 能拉起 web 在 `127.0.0.1:8728`；伪造的未知 event type 被保存而不是丢弃。
 
 **PR 2 — 传输。** inbox watcher 与 webhook 客户端（超时、一次网络重试、redact、quarantine、幂等 `message_id`）。`audi28 grokbot test` 同类命令。验收：向临时目录写入合法 `task` 文件会得到 `inbox_received` 事件并移到 `processed/`；坏 JSON 在重试后进入 `quarantine/`；symlink 和超大文件被隔离；用本地 HTTP server 测 webhook：2xx 成功，非 2xx 和超时记 `error` 且日志无密钥。
 
-**PR 3 — Router 与 session 存储。** 规则路由 + `data/sessions` 的 CRUD、list、close、sticky 匹配。验收：fixtures 覆盖显式 `self`、显式 `deepseek`、默认；重启后 session 文件仍在；关闭后的 id 拒绝新 task；两条事件能串成 `ref` 链。
+**PR 3 — Router 与 session 存储。** 第 9 节的规则路由 + `data/sessions` 的 CRUD、list、close。验收：fixtures 覆盖显式 `self`、显式 `deepseek`、默认 `deepseek`；正文含「新任务」时 `session_action=new` 并写下 reason；否则继续最近一个仍开放的 session；没有可继续的 session 时才新开，reason 说明原因；重启后 session 文件仍在；关闭后的 id 拒绝新 task；`route` 事件带 reason，并能用 `ref` 串回 inbox 消息。
 
 **PR 4 — DeepSeek adapter。** 加上 `deepseek-harness-sdk` 依赖（建议 optional extra `deepseek`，避免没装密钥的 CI 强行拉运行时，或在 CI 里 mock 子进程）。实现启动、`run`、`resume_session`、并发的 `next_request` 循环、`on_user_question`。验收：用 fake/stub 运行时（或录制的 JSON-RPC）证明 prompt 被发送、`final_response` 变成 `reply` 事件、resume 走 `session/resume` 而不是新 id；缺失的 session id 按官方行为报错，不静默另建。
 
-**PR 5 — 审批中心 + 文案 + 仪表盘。** 规范化 schema、超时 deny、幂等、来源标签、`spoken_text` 不含路径。仪表盘展示 session 与 pending 审批（只读即可）。端到端验收（可用 stub Harness）：
+**PR 5 — 审批中心 + 文案 + 仪表盘。** 规范化 schema、pending 一直等到用户回答（不自动拒绝）、幂等、来源标签、`spoken_text` 不含路径。仪表盘展示 session 与 pending 审批（只读即可）。端到端验收（可用 stub Harness）：
 
 1. inbox `task` → route `deepseek` → stub `run` → webhook `result`。
-2. 带同一 `session_id` 的第二条 task → 同一 backend session，而不是新的。
+2. 第二条 task 没有新任务说法 → 同一个 backend session，而不是新的。
 3. stub 发出 `approval/request` → webhook 文案以「DeepSeek 在问你」开头 → inbox `decision: allow` → 向 stub 返回 `allowed-once`。
-4. 超时且无 decision → 返回 `rejected`，并向 Audi 发到期通知。
+4. 没有 decision 时不会变成 `rejected`。进程重启后这条审批仍是 pending，仪表盘列得出，启动时会再次通知 Audi。
 5. 重复的 `idempotency_key` 不向用户问第二次。
 
-**PR 6 — `doctor` 与文档抛光。** 检查：SDK import、`dsh_home`、`.env` 里是否存在密钥（不打印值）、inbox 可写、supervisor / 运行时 liveness、最近错误。README 补充如何配置 webhook routine 和 Allow rule。
+**PR 6 — `doctor` 与文档抛光。** 骨架已经会在密钥缺失时给出补法，且不打印密钥的值。这一步补上：SDK import、`dsh_home`、inbox 可写、supervisor / 运行时 liveness、最近错误。README 补充如何配置 webhook routine。Allow rule 已批准，见第 7 节。
 
 ### 之后的阶段（不在本次实现范围）
 
@@ -484,18 +512,20 @@ Phase 1 代码按上面拆模块，但每个 PR 只交能独立验证的一小�
 
 - Python 的 `next_request()` 必须与 `run()` 并发，否则会卡住或把审批 fail closed。实现时以官方 `manage_plugins.py` 为准。
 - 没有 session-close RPC；进行中的 turn 不能干净取消。要对用户说实话。
-- `user-question` 的 id 在运行时重启后不可用。
+- `user-question` 的 id 在运行时重启后不可用。audi28 不因此自动拒绝，见第 8 节。
 - `resume_session` 不恢复外部进程，跟进任务可能让 DeepSeek 以为环境还在。
 - Claude Code / Codex 的示例配置尚未实跑。Phase 2/3 要重新核对 [Claude Code hooks](https://code.claude.com/docs/en/hooks) 和 [Codex hooks](https://learn.chatgpt.com/docs/hooks)。
-- 官方默认模型名写的是 `deepseek-v4-flash`、provider `deepseek-official`。Ruoran 本机实际用的模型和密钥位置还没确认（见开放问题）。
+- 官方默认模型名写的是 `deepseek-v4-flash`、provider `deepseek-official`。密钥位置已定：`~/Code/audi28/.env`（gitignore）或环境变量 `DEEPSEEK_API_KEY`。Ruoran 稍后把密钥放进去。缺失时 `doctor` 说明补法，进程不崩溃。模型先用这个默认值，直到另有决定。
 - 同一进程里多个 `session.run` 的重叠行为虽有文档，本机尚未验证。Phase 1 倾向于串行。
 - inbox 与 webhook 不是原子事务。所有状态机必须能承受重复文件、迟到的 decision、以及「结果 webhook 成功但 Audi 没说出口」。
-- 把 coding agent 接到语音/聊天，等于给远程助手一条间接的本机工具通道。工作区范围、一次性批准、超时拒绝，都是故意收紧的。
+- 把 coding agent 接到语音/聊天，等于给远程助手一条间接的本机工具通道。工作区范围和一次性批准是故意收紧的。没等到用户回答就不会放行，也不会到点自动拒绝。
 
-## 18. 需要 Ruoran 决定的问题
+## 18. 已决定的问题（2026-11-20）
 
-1. **Allow rule。** 可否增加一条：允许 Audi 把 JSON 文件写入 `~/Code/audi28/data/inbox/audi/`（可自动建目录），其它 Mac 写入仍需批准？没有这条规则，每次任务和每次审批回答都要你点一次批准。
-2. **Workspace 与权限。** DeepSeek 的默认 workspace 用专用目录（例如 `~/Code/audi28/workspace`），还是每次由你指定一个 repo？默认权限预设用 `workspace-write`（工具仍要问你）可以吗？
-3. **Session 黏连。** 你没说「继续」、Audi 也没带 `session_id` 时：是黏到最近一个仍开放的 session，还是每个新任务都开新 session？
-4. **密钥。** Mac 上是否已经有 `DEEPSEEK_API_KEY`？放到 `~/Code/audi28/.env`（gitignore）可以吗？
-5. **审批超时。** 默认 600 秒且超时拒绝（fail closed），这个时长和策略可以吗？
+下面五条已经由 Ruoran 决定，不再是开放问题。未验证的技术风险仍在第 17 节。
+
+1. **Allow rule。** 已批准。Audi 可以把 JSON 写入 `~/Code/audi28/data/inbox/audi/`，目录不存在可以建，不用再问。其它 Mac 写入仍要单独批准。见第 7 节。
+2. **Workspace 与权限。** 默认工作区是 `~/Code` 下的新目录 `~/Code/deepseek-workspace`，可在 `config.toml` 里改。权限预设 `workspace-write`。工具调用仍走审批。见第 4、14 节。
+3. **Session。** 默认继续最近一个仍开放的 session。router 根据上下文判断用户是不是要新任务；只有明确说要新任务（例如「新任务」「开一个新的」「new task」）才另开。决定带 `reason`，写成 `route` 事件。规则优先，以后可以插一个 LLM 判断。见第 9 节。
+4. **密钥。** `DEEPSEEK_API_KEY` 稍后由 Ruoran 提供。从 `~/Code/audi28/.env`（gitignore）或环境变量读取。缺失时 `doctor` 说明补法，进程不崩溃。
+5. **审批超时。** 不自动拒绝。pending 的审批和提问一直等到用户回答。它们挺过重启，会再次提醒，仪表盘上看得到。没有 600 秒拒绝的默认值。见第 10 节。
