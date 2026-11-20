@@ -160,13 +160,15 @@ Ruoran 已同意下面这一条，且只同意这一条。实现时不要扩大�
 
 Inbox 根目录是 `data/inbox/audi/`。watcher 只认这里的 `*.json`，不跟随 symlink，也不把子目录里的文件再当新任务。
 
-领取是原子的：把文件 `rename` 到 `processing/`。两个进程同时看到同一个文件时，只有一个 rename 成功。然后：
+领取是原子的：先把文件 `rename` 到 `processing/`，再看领到的那个文件。两个进程同时看到同一个名字时，只有一个 rename 成功。检查发生在领取之后，避免刚判断完它不是 symlink、文件却被换掉。然后：
 
-- 是 symlink，或大小超过 `[inbox] max_bytes`：立刻移到 `quarantine/`，不读链接目标，也不把文件正文读进内存。记一条 `error`。
+- 领到的是 symlink，或大小超过 `[inbox] max_bytes`：立刻移到 `quarantine/`，不读链接目标，也不把超限的正文读进内存。记一条 `error`。
 - JSON 解析失败，或解析结果不是对象，或缺少非空字符串 `kind` / `message_id`：留在 `processing/`，按 `[inbox] parse_retries` 个 tick 再试。用尽后移到 `quarantine/`，记一条 `error`。
 - 合法文件：`message_id` 已经有过 `inbox_received` 就不再处理第二次，文件直接进 `processed/`，另记一条 `error` 说明是重复。否则先追加 `inbox_received`（`source` 为 `inbox`，`ref` 为 `message_id`，`data.message` 是原文），再移到 `processed/`。事件里不写绝对路径。文件里若还有 `idempotency_key`，同一个 key 也只处理一次。
 
-出站先落在 `data/outbox/grokbot/pending/`，再 POST。发送前原子地改名为 `inflight/`，成功后进入 `sent/`。进程在 `inflight/` 里重启的话，下一次 flush 把文件放回 `pending/` 再发。URL 和 key 只来自 `AUDI28_GROKBOT_WEBHOOK_URL` 和 `AUDI28_GROKBOT_WEBHOOK_KEY`。它们不进 outbox 文件、事件或日志。缺其中任何一个时不发请求，pending 原样留着。
+出站先落在 `data/outbox/grokbot/pending/`，再 POST。`flush` 持有这个 outbox 的排他锁（线程锁，再加 `fcntl` 的 `.lock`），发送过程中不放开。发送前原子地改名为 `inflight/`，并记下认领它的进程。成功后进入 `sent/`。如果这时文件已经不在了，仍然记 `webhook` 事件，不因为 `rename` 失败把这次成功丢掉。另一个活着的进程认领的 `inflight/` 文件不能被抢走。没有活进程认领的（进程已经退出，或根本没写上认领者）下一次 flush 放回 `pending/` 再发。pending 里解析不了、或没有对象形态 `payload` 的文件进 `quarantine/`，记一条 `error`，不要留在原地永远跳过。URL 和 key 只来自 `AUDI28_GROKBOT_WEBHOOK_URL` 和 `AUDI28_GROKBOT_WEBHOOK_KEY`。它们不进 outbox 文件、事件或日志。缺其中任何一个时不发请求，pending 原样留着。
+
+supervisor 的传输循环碰到异常时记一条 `error`（不写进密钥和 URL），然后继续跑。不要把异常吞掉。
 
 同一次 flush 里，网络错误或超时按短退避再试一次。仍然失败就记 `error`，文件回到 pending，并推迟下一次尝试，避免 supervisor 空转时打满对端。非 2xx 不在同一次 flush 里重试，同样记 `error` 并留在 pending，重启后还会再试。2xx 记一条 `webhook` 事件（`status` 为 `sent`）。入队时另记一条 `webhook`（`status` 为 `queued`）。成功和失败的事件都不含 URL、key 或 Authorization 头。
 
@@ -489,7 +491,7 @@ webhook 体（audi28 → Audi）：
   data/                        # gitignore；运行时
     events/YYYY-MM-DD.jsonl
     inbox/audi/{processing,processed,quarantine}/
-    outbox/grokbot/{pending,inflight,sent}/
+    outbox/grokbot/{pending,inflight,sent,quarantine}/
     sessions/
     dsh-home/
     audi28.log

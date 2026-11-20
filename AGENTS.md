@@ -31,7 +31,7 @@ audi28 是本机的 agent 会话层和统一审批中心。用户通过 Audi（G
 
 - Audi 不能访问本机 HTTP。任务从 `data/inbox/audi/` 进，结果从 webhook 出。不要设计「让云端去打 127.0.0.1」。
 - inbox 不跟随 symlink；超过 1MB 或无法解析的文件在有限次重试后进入 `quarantine/`。同一 `message_id` / `idempotency_key` 只处理一次。领取用原子 rename。
-- 出站 webhook 先写入 `data/outbox/grokbot/`，再 POST。网络错误或超时在同一次发送里按短退避重试一次；失败留在 outbox，重启后续发。事件和日志里不能出现 webhook URL 或 key。
+- 出站 webhook 先写入 `data/outbox/grokbot/`，再 POST。flush 持有排他锁。网络错误或超时在同一次发送里按短退避重试一次；失败留在 outbox，重启后续发。别的活进程认领中的 `inflight/` 文件不能抢走。事件和日志里不能出现 webhook URL 或 key。
 - 云端助手往 Mac 写文件，除了用户已批准的 inbox Allow rule 之外，每一次都要单独批准。不要在实现阶段扩大写入范围。
 
 ## 测试与 PR

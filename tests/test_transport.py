@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import time
 import urllib.error
@@ -9,7 +10,9 @@ from pathlib import Path
 import pytest
 
 from audi28.cli import main
+from audi28.config import load_config
 from audi28.events import EventLog
+from audi28.supervisor import _transport_loop
 from audi28.transport import Inbox, Outbox
 from tests.conftest import write_config
 
@@ -130,6 +133,19 @@ def _outbox(tmp_path: Path, url: str | None, *, timeout_s: float = 10, backoff_s
 
 def _types(events: EventLog) -> list[str]:
     return [event.type for event in events.replay()]
+
+
+def _dead_pid() -> int:
+    candidate = os.getpid() + 100000
+    while True:
+        try:
+            os.kill(candidate, 0)
+        except ProcessLookupError:
+            return candidate
+        except PermissionError:
+            candidate += 1
+            continue
+        candidate += 1
 
 
 def test_valid_task_is_received_and_processed(tmp_path):
@@ -352,6 +368,162 @@ def test_grokbot_test_uses_the_fake_server(tmp_path, monkeypatch, fake_webhook, 
     text = capsys.readouterr().out + capsys.readouterr().err
     assert SECRET not in text
     assert fake_webhook.url not in text
+
+
+def test_concurrent_flush_does_not_double_send(tmp_path):
+    server = FakeWebhook(delay_s=0.4)
+    entered = threading.Event()
+    real_open = urllib.request.urlopen
+
+    def opener(request, timeout=10):
+        entered.set()
+        return real_open(request, timeout=timeout)
+
+    try:
+        events = EventLog(tmp_path / "events")
+        first = Outbox(
+            tmp_path / "outbox",
+            events,
+            url=server.url,
+            key=SECRET,
+            timeout_s=2,
+            backoff_s=0,
+            secrets=(SECRET, server.url),
+            opener=opener,
+        )
+        first.enqueue({"kind": "result", "text": "只发一次"})
+        second = Outbox(
+            first.root,
+            events,
+            url=server.url,
+            key=SECRET,
+            timeout_s=2,
+            backoff_s=0,
+            secrets=(SECRET, server.url),
+            opener=opener,
+        )
+
+        def flush(outbox: Outbox) -> None:
+            outbox.flush_once()
+
+        leader = threading.Thread(target=flush, args=(first,))
+        leader.start()
+        assert entered.wait(timeout=2)
+        follower = threading.Thread(target=flush, args=(second,))
+        follower.start()
+        leader.join(timeout=3)
+        follower.join(timeout=3)
+    finally:
+        server.close()
+
+    assert not leader.is_alive()
+    assert not follower.is_alive()
+    assert len(server.requests) == 1
+    sent = [event for event in events.replay() if event.type == "webhook" and event.data.get("status") == "sent"]
+    assert len(sent) == 1
+
+
+def test_abandoned_inflight_file_is_sent_by_a_new_outbox(tmp_path, fake_webhook):
+    outbox, events = _outbox(tmp_path, fake_webhook.url, backoff_s=0)
+    outbox.inflight.mkdir(parents=True)
+    dead_owner = _dead_pid()
+    (outbox.inflight / "abandoned.json").write_text(
+        json.dumps(
+            {
+                "id": "out-abandoned",
+                "payload": {"kind": "result", "text": "上次没发完"},
+                "attempts": 0,
+                "owner_pid": dead_owner,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restarted = Outbox(
+        outbox.root,
+        events,
+        url=fake_webhook.url,
+        key=SECRET,
+        timeout_s=2,
+        backoff_s=0,
+        secrets=(SECRET, fake_webhook.url),
+    )
+    restarted.flush_once()
+
+    assert len(fake_webhook.requests) == 1
+    assert json.loads(fake_webhook.requests[0]["body"])["text"] == "上次没发完"
+    assert list((outbox.root / "sent").glob("*.json"))
+    assert list((outbox.root / "inflight").glob("*.json")) == []
+
+
+def test_live_owner_inflight_file_is_not_stolen(tmp_path, fake_webhook):
+    outbox, _events = _outbox(tmp_path, fake_webhook.url, backoff_s=0)
+    outbox.inflight.mkdir(parents=True)
+    (outbox.inflight / "busy.json").write_text(
+        json.dumps(
+            {
+                "id": "out-busy",
+                "payload": {"kind": "result", "text": "别人正在发"},
+                "attempts": 0,
+                "owner_pid": os.getppid(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    outbox.flush_once()
+
+    assert fake_webhook.requests == []
+    assert (outbox.inflight / "busy.json").is_file()
+
+
+def test_malformed_pending_outbox_file_is_quarantined(tmp_path, fake_webhook):
+    outbox, events = _outbox(tmp_path, fake_webhook.url, backoff_s=0)
+    outbox.pending.mkdir(parents=True)
+    (outbox.pending / "bad.json").write_text("{not-json", encoding="utf-8")
+    (outbox.pending / "nopayload.json").write_text(
+        json.dumps({"id": "out-empty"}),
+        encoding="utf-8",
+    )
+
+    outbox.flush_once()
+
+    assert list(outbox.pending.glob("*.json")) == []
+    quarantined = list((outbox.root / "quarantine").glob("*.json"))
+    assert len(quarantined) == 2
+    assert sum(1 for event in events.replay() if event.type == "error") >= 2
+    assert fake_webhook.requests == []
+
+
+def test_transport_loop_records_supervisor_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("AUDI28_GROKBOT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("AUDI28_GROKBOT_WEBHOOK_KEY", raising=False)
+    config_path = write_config(tmp_path)
+    config = load_config(config_path)
+    audi = config.root / "data" / "inbox" / "audi"
+    audi.parent.mkdir(parents=True)
+    audi.write_text("not a directory", encoding="utf-8")
+    stop = threading.Event()
+    thread = threading.Thread(target=_transport_loop, args=(config, stop))
+    thread.start()
+    events = EventLog(config.root / "data" / "events")
+    found = False
+    deadline = time.time() + 2
+    try:
+        while time.time() < deadline:
+            found = any(
+                event.type == "error" and event.source == "supervisor" for event in events.replay()
+            )
+            if found:
+                break
+            time.sleep(0.05)
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+
+    assert found
+    assert not thread.is_alive()
 
 
 def test_grokbot_test_without_env_makes_no_request(tmp_path, monkeypatch, fake_webhook, capsys):

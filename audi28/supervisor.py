@@ -65,10 +65,26 @@ def _transport_loop(config: Config, stop: threading.Event) -> None:
         try:
             inbox.poll_once()
             outbox.flush_once()
-        except Exception:
-            # A bad file or a down webhook must not take the dashboard with it.
-            pass
+        except Exception as exc:
+            # Keep the dashboard up, but do not hide the failure.
+            _record_loop_error(events, exc, secrets=(url, key))
         stop.wait(config.inbox.poll_s)
+
+
+def _record_loop_error(events: EventLog, exc: Exception, *, secrets: tuple[str, ...]) -> None:
+    detail = str(exc)
+    for secret in secrets:
+        if secret:
+            detail = detail.replace(secret, "[redacted]")
+    try:
+        events.append(
+            type="error",
+            source="supervisor",
+            ref=None,
+            data={"reason": type(exc).__name__, "detail": detail},
+        )
+    except Exception:
+        return
 
 
 def _wait_for_signal(stop: threading.Event) -> None:

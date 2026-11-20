@@ -49,33 +49,32 @@ class Inbox:
 
     def poll_once(self) -> None:
         self._ensure_dirs()
-        with _inbox_thread_lock(self.root), self._decision_lock():
+        with _thread_lock(self.root), self._decision_lock():
             self._refresh_seen()
             leftovers = _json_files(self.processing)
             incoming = _json_files(self.root)
             for path in leftovers:
-                self._accept_one(path, incoming=False)
+                self._accept_one(path)
             for path in incoming:
-                self._accept_one(path, incoming=True)
+                self._accept_one(path)
 
     def _ensure_dirs(self) -> None:
         for directory in (self.root, self.processing, self.processed, self.quarantine):
             directory.mkdir(parents=True, exist_ok=True)
 
-    def _accept_one(self, path: Path, *, incoming: bool) -> None:
-        if incoming and path.is_symlink():
-            self._quarantine(path, "symlink")
-            return
-        if incoming:
-            try:
-                size = path.lstat().st_size
-            except FileNotFoundError:
-                return
-            if size > self._max_bytes:
-                self._quarantine(path, "too-large")
-                return
+    def _accept_one(self, path: Path) -> None:
         claimed = self._claim(path)
         if claimed is None:
+            return
+        if claimed.is_symlink():
+            self._quarantine(claimed, "symlink")
+            return
+        try:
+            size = claimed.lstat().st_size
+        except FileNotFoundError:
+            return
+        if size > self._max_bytes:
+            self._quarantine(claimed, "too-large")
             return
         self._finish_one(claimed)
 
@@ -160,10 +159,7 @@ class Inbox:
         self._seen_keys.update(keys)
 
     def _decision_lock(self):
-        self.root.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.root / ".lock", os.O_CREAT | os.O_RDWR, 0o644)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        return _LockedFd(fd)
+        return _exclusive_lock(self.root)
 
     def _error(self, reason: str, *, ref: str | None) -> None:
         self._events.append(
@@ -195,6 +191,7 @@ class Outbox:
         self.pending = self.root / "pending"
         self.inflight = self.root / "inflight"
         self.sent = self.root / "sent"
+        self.quarantine = self.root / "quarantine"
         self._events = events
         self.url = url.strip() if isinstance(url, str) else ""
         self.key = key.strip() if isinstance(key, str) else ""
@@ -226,18 +223,16 @@ class Outbox:
 
     def flush_once(self) -> None:
         self._ensure_dirs()
-        self._recover_inflight()
-        if not self._credentials_ok():
-            return
-        for path in _json_files(self.pending):
-            self._flush_one(path)
+        with _thread_lock(self.root), _exclusive_lock(self.root):
+            self._recover_inflight()
+            for path in _json_files(self.pending):
+                self._flush_one(path)
 
     def _flush_one(self, path: Path) -> None:
-        try:
-            item = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError, FileNotFoundError):
+        item = self._load_item(path)
+        if item is None:
             return
-        if not isinstance(item, dict) or not isinstance(item.get("payload"), dict):
+        if not self._credentials_ok():
             return
         if not _due(item.get("next_attempt_ts"), self._clock):
             return
@@ -246,28 +241,71 @@ class Outbox:
             os.rename(path, claimed)
         except FileNotFoundError:
             return
+        item["owner_pid"] = os.getpid()
+        try:
+            _atomic_json(claimed, item)
+        except OSError:
+            return
         reason = self._deliver(item["payload"])
+        ref = str(item.get("id") or path.stem)
         if reason is None:
-            os.rename(claimed, _unique_destination(self.sent, path.name))
+            try:
+                os.rename(claimed, _unique_destination(self.sent, path.name))
+            except FileNotFoundError:
+                pass
             self._events.append(
                 type="webhook",
                 source="webhook",
-                ref=str(item.get("id") or path.stem),
+                ref=ref,
                 data={"status": "sent"},
             )
             return
         extra = 2 if reason in {"timeout", "network"} else 1
         item["attempts"] = int(item.get("attempts") or 0) + extra
+        item.pop("owner_pid", None)
         delay = self.backoff_s * (2 ** min(int(item["attempts"]), 5))
         item["next_attempt_ts"] = (self._clock() + timedelta(seconds=delay)).isoformat()
-        _atomic_json(self.pending / path.name, item)
-        if claimed.exists():
-            claimed.unlink()
+        try:
+            _atomic_json(self.pending / path.name, item)
+        except OSError:
+            return
+        try:
+            if claimed.exists():
+                claimed.unlink()
+        except FileNotFoundError:
+            pass
         self._events.append(
             type="error",
             source="webhook",
-            ref=str(item.get("id") or path.stem),
+            ref=ref,
             data={"reason": _redact_value(reason, self._secrets), "status": "error"},
+        )
+
+    def _load_item(self, path: Path) -> dict[str, Any] | None:
+        try:
+            item = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            self._quarantine_outbox(path, "malformed")
+            return None
+        if not isinstance(item, dict) or not isinstance(item.get("payload"), dict):
+            self._quarantine_outbox(path, "malformed")
+            return None
+        return item
+
+    def _quarantine_outbox(self, path: Path, reason: str) -> None:
+        self.quarantine.mkdir(parents=True, exist_ok=True)
+        destination = _unique_destination(self.quarantine, path.name)
+        try:
+            os.rename(path, destination)
+        except FileNotFoundError:
+            return
+        self._events.append(
+            type="error",
+            source="webhook",
+            ref=path.stem,
+            data={"reason": reason},
         )
 
     def _deliver(self, payload: Mapping[str, Any]) -> str | None:
@@ -306,10 +344,17 @@ class Outbox:
         return f"http {status}"
 
     def _recover_inflight(self) -> None:
+        me = os.getpid()
         for path in _json_files(self.inflight):
+            owner = _owner_pid(path)
+            if owner is not None and owner != me and _pid_alive(owner):
+                continue
             destination = self.pending / path.name
             if destination.exists():
-                path.unlink()
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
                 continue
             try:
                 os.rename(path, destination)
@@ -317,7 +362,7 @@ class Outbox:
                 continue
 
     def _ensure_dirs(self) -> None:
-        for directory in (self.pending, self.inflight, self.sent):
+        for directory in (self.pending, self.inflight, self.sent, self.quarantine):
             directory.mkdir(parents=True, exist_ok=True)
 
     def _credentials_ok(self) -> bool:
@@ -328,7 +373,7 @@ class Outbox:
         return True
 
 
-def _inbox_thread_lock(root: Path) -> threading.Lock:
+def _thread_lock(root: Path) -> threading.Lock:
     key = str(root.resolve())
     with _INBOX_THREAD_GUARD:
         lock = _INBOX_THREAD_LOCKS.get(key)
@@ -336,6 +381,40 @@ def _inbox_thread_lock(root: Path) -> threading.Lock:
             lock = threading.Lock()
             _INBOX_THREAD_LOCKS[key] = lock
         return lock
+
+
+def _exclusive_lock(directory: Path) -> _LockedFd:
+    directory.mkdir(parents=True, exist_ok=True)
+    fd = os.open(directory / ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return _LockedFd(fd)
+
+
+def _owner_pid(path: Path) -> int | None:
+    try:
+        item = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(item, dict):
+        return None
+    owner = item.get("owner_pid")
+    if isinstance(owner, bool) or not isinstance(owner, int):
+        return None
+    return owner
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 class _LockedFd:
