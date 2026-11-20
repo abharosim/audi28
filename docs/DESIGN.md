@@ -1,6 +1,6 @@
 # audi28 设计文档
 
-> 状态：2026-11-20 的决定已写入正文。Phase 1 的骨架、传输、规则路由和 session 存储已在本仓库；DeepSeek adapter、审批中心尚未实现。
+> 状态：2026-11-20 的决定已写入正文。Phase 1 的骨架、传输、规则路由、session 存储和 DeepSeek adapter 已在本仓库；审批中心的仪表盘尚未实现。
 > 日期：2026-11-19 起草（America/New_York），2026-11-20 按 Ruoran 的决定改定。
 > 项目位置：Mac 上 `~/Code/audi28`，与 `~/Code/audi27` 并列。本仓库就是这份实现。
 
@@ -59,7 +59,7 @@ audi28 是**独立服务**。两者可以同机并列运行，通过文件或本
 | --- | --- | --- |
 | CLI | `dsh`。`dsh --profile sdk` 向 SDK 客户端提供 stdio JSON-RPC；`dsh --profile headless` 跑完一个任务就退出 | [CLI help](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/cli-help.md) |
 | TypeScript SDK | `@deepseek-ai/dsh-sdk-client`。`approvalRequests: true`，`client.start()` 后用 `client.onRequest` 处理 `approval/request` | [TS client README](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/sdk/client/README.md) |
-| Python SDK | 包名 `deepseek-harness-sdk`（会安装同版本的 `deepseek-harness-runtime-bin`）。启动捆绑的 `dsh --profile sdk`。audi28 用这个，与 audi27 的语言一致 | [Python SDK README](https://github.com/deepseek-ai/deepseek-harness/blob/master/python/sdk/README.md) |
+| Python SDK | 包名 `deepseek-harness-sdk`，本仓库钉在 PyPI 上的 `0.2.2rc2`（会装同版本的 `deepseek-harness-runtime-bin`）。启动捆绑的 `dsh --profile sdk`。公开入口是 `DeepSeekHarness` / `DeepSeekHarnessConfig`、`start_session`、`resume_session(session_id)`、`Session.run`、`client.next_request`、`client.respond`，用户提问走 `on_user_question`。这个版本的 `resume_session` 只收 session id，没有 permission 参数 | [Python SDK README](https://github.com/deepseek-ai/deepseek-harness/blob/master/python/sdk/README.md)，以及 PyPI `0.2.2rc2` 的 wheel |
 | 传输 | newline-delimited JSON-RPC 2.0，走子进程 stdio。文档里没有 REST API | [wire protocol](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/sdk/protocol/README.md) |
 | 认证 | 子进程继承环境变量 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`；也可用构造参数 `api_key` / `base_url` 覆盖。必须显式给 `dsh_home`，SDK **不会**去发现 `~/.dsh` | 同上 Python README |
 | Session 创建 | `harness.run(text, session_id=...)` 或 `start_session(id)`（后者只是懒句柄，不恢复已持久化的会话） | 同上 |
@@ -67,12 +67,12 @@ audi28 是**独立服务**。两者可以同机并列运行，通过文件或本
 | 权限预设 | 标准 `sdk` profile 有 `read-only`、`workspace-write`、`danger-full-access`。恢复时可选覆盖。`sdk-minimal` 没有这套权限服务 | 同上 |
 | 审批（Python） | `approval_requests=True`。必须另开线程/循环调用 `client.next_request()`，与 `run()` / `session/wait` **并发**。对 `approval/request` 用 `client.respond(id, {"outcome": "allowed-once"\|"rejected"\|"cancelled"})`。没有处理函数时 fail closed。决定是一次性的；连接断开则待决请求失败关闭 | 同上，以及 [`examples/manage_plugins.py`](https://github.com/deepseek-ai/deepseek-harness/blob/master/python/sdk/examples/manage_plugins.py) |
 | 审批请求字段 | `ApprovalRequestParams`：`sessionId`、`toolName`、可选 `callId`、可选 `reason` | [protocol README](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/sdk/protocol/README.md)、[Rust docs](https://docs.rs/deepseek-harness-sdk-rs/latest/deepseek_harness_sdk_rs/client/struct.ApprovalRequestParams.html) |
-| 用户提问 | `on_user_question` 回调（Python）或 `userQuestions` capability。运行时发 `user-question/ask`：`{requestId, sessionId, questions}`。回答 `{answers:[{id, selected, custom?}]}`（每个问题 id 恰好一次），或 `{cancelled: true}` 表示用户关闭。`user-question.cancelled` 通知后应丢掉迟到的回复 | protocol README、Python SDK README |
+| 用户提问 | `on_user_question` 回调（Python）或 `userQuestions` capability。运行时发 `user-question/ask`：`{requestId, sessionId, questions}`。回答 `{answers:[{id, selected, custom?}]}`（`selected` 是标签列表，每个问题 id 恰好一次），或 `{cancelled: true}` 表示用户关闭。`user-question.cancelled` 通知后应丢掉迟到的回复 | protocol README、Python SDK README |
 | 已知限制 | 没有 session-close / cancel 的 RPC；放弃一轮要关运行时进程。`user-question` 的 request id **不能**在运行时重启后继续回答 | protocol「Known Limitations」 |
 
 说明：DaDa 文档和 TypeScript 示例用的是 `client.onRequest(...)`。Python 镜像同一套协议，但公开 API 是 `next_request()` + `respond()`，外加独立的 `on_user_question`。audi28 按 Python API 写，不要照抄 TS 回调签名。
 
-Phase 1 用完整 `sdk` profile（需要权限预设），`dsh_home` 放在项目下的 `data/dsh-home`，不要用 `~/.dsh`。默认权限 `workspace-write`，并打开 `approval_requests`，这样写操作仍要经过审批中心。加载配置时只接受 `read-only` 和 `workspace-write`，拒绝 `danger-full-access` 以及其它值。也不要使用 headless 的 `--approval-policy never`。
+Phase 1 用完整 `sdk` profile（需要权限预设），`dsh_home` 放在项目下的 `data/dsh-home`，不要用 `~/.dsh`。默认权限 `workspace-write`，并打开 `approval_requests`，这样写操作仍要经过审批中心。加载配置时只接受 `read-only` 和 `workspace-write`，拒绝 `danger-full-access` 以及其它值。也不要使用 headless 的 `--approval-policy never`。PyPI 上钉住的 `deepseek-harness-sdk==0.2.2rc2` 没有 `permission_mode` 构造参数，`resume_session` 也只收 session id。工作区用 `cwd` 传给 SDK（目录不存在就创建）。权限预设在每次 `start_session` / `resume_session` 之后，用 `Session.run("/permission workspace-write")` 设上，再跑用户的提示。上游 master 的 README 写了 `resume_session(id, {"permission_mode": ...})`，这个已发布版本还没有那个参数，不要按 README 去传。`start()` 在 `start_session()` 返回后立刻把 backend session id 写进 session 文件，然后才把提示交给会话自己的工作线程。传输循环不在 `run()` 里等待审批。同一个 session 同时只跑一轮，后续提示排队。审批线程遇到不认识的请求用 `respond_error(-32601)` 回答。传输循环退出时，以及 SIGINT / SIGTERM 让循环停下来时，调用 backend `close()`：给每个会话队列送结束标记，`harness.close()` 回收 `dsh` 子进程，再在超时内等会话线程和审批线程退出。
 
 默认 workspace 是 `~/Code/deepseek-workspace`，写在 `config.toml` 的 `[deepseek] workspace`，可以改成另一个目录。加载配置时把 `~` 展开成绝对路径。没写 workspace，或写成相对路径，都是配置错误，不会悄悄改用 `$HOME` 下的别的目录。`workspace-write` 只划定 DeepSeek 能碰到的目录；每一次工具调用仍然进入审批中心。
 

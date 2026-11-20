@@ -6,7 +6,8 @@ import os
 import signal
 import threading
 
-from audi28.backend import UnconnectedBackend
+from audi28.adapters.deepseek import DeepSeekBackend
+from audi28.approvals import PendingStore
 from audi28.config import Config
 from audi28.dispatch import Dispatcher
 from audi28.events import EventLog
@@ -41,10 +42,10 @@ def supervise(config: Config, *, stop: threading.Event | None = None) -> None:
         stop.set()
         server.shutdown()
         web_thread.join(timeout=5)
-        transport_thread.join(timeout=5)
+        transport_thread.join(timeout=8)
 
 
-def _transport_loop(config: Config, stop: threading.Event) -> None:
+def _transport_loop(config: Config, stop: threading.Event, harness_factory=None) -> None:
     events = EventLog(config.root / "data" / "events")
     url = os.environ.get("AUDI28_GROKBOT_WEBHOOK_URL", "").strip()
     key = os.environ.get("AUDI28_GROKBOT_WEBHOOK_KEY", "").strip()
@@ -65,6 +66,22 @@ def _transport_loop(config: Config, stop: threading.Event) -> None:
         timeout_s=config.grokbot.timeout_s,
         secrets=(url, key),
     )
+    sessions = SessionStore(config.root / "data" / "sessions")
+    backend = DeepSeekBackend(
+        api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+        workspace=config.deepseek.workspace,
+        dsh_home=config.deepseek.dsh_home,
+        permission_mode=config.deepseek.permission_mode,
+        provider=config.deepseek.provider,
+        model=config.deepseek.model,
+        profile=config.deepseek.profile,
+        initialize_timeout_seconds=config.deepseek.initialize_timeout_seconds,
+        outbox=outbox,
+        events=events,
+        pending=PendingStore(config.root / "data" / "approvals"),
+        sessions=sessions,
+        harness_factory=harness_factory,
+    )
     dispatcher = Dispatcher(
         router=RulesRouter(
             default=config.route.default,
@@ -72,23 +89,27 @@ def _transport_loop(config: Config, stop: threading.Event) -> None:
             not_new_task_phrases=config.route.not_new_task_phrases,
             self_phrases=config.route.self_phrases,
         ),
-        sessions=SessionStore(config.root / "data" / "sessions"),
-        backend=UnconnectedBackend(),
+        sessions=sessions,
+        backend=backend,
         events=events,
         workspace=str(config.deepseek.workspace),
+        outbox=outbox,
     )
-    while not stop.is_set():
-        try:
-            for message in _messages_to_dispatch(inbox):
-                dispatcher.handle(message)
-                message_id = message.get("message_id")
-                if isinstance(message_id, str) and message_id.strip():
-                    inbox.complete(message_id.strip())
-            outbox.flush_once()
-        except Exception as exc:
-            # Keep the dashboard up, but do not hide the failure.
-            _record_loop_error(events, exc, secrets=(url, key))
-        stop.wait(config.inbox.poll_s)
+    try:
+        while not stop.is_set():
+            try:
+                for message in _messages_to_dispatch(inbox):
+                    dispatcher.handle(message)
+                    message_id = message.get("message_id")
+                    if isinstance(message_id, str) and message_id.strip():
+                        inbox.complete(message_id.strip())
+                outbox.flush_once()
+            except Exception as exc:
+                # Keep the dashboard up, but do not hide the failure.
+                _record_loop_error(events, exc, secrets=(url, key))
+            stop.wait(config.inbox.poll_s)
+    finally:
+        backend.close()
 
 
 def _messages_to_dispatch(inbox: Inbox) -> list[dict]:

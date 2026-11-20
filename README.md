@@ -12,7 +12,7 @@ audi28 是独立项目，放在 `~/Code/audi28`，和 `~/Code/audi27` 并列。�
 
 ## 现状
 
-仓库里已经有骨架、传输、规则路由和 session 存储。CLI 有 `events`、`supervise`、`web`、`doctor`、`grokbot test`、`sessions list`、`sessions close`。`start.sh` 拉起只监听 `127.0.0.1:8728` 的占位仪表盘，并轮询 inbox、做路由、flush webhook outbox。DeepSeek adapter 和审批中心还没做。没有说要新任务时，继续最近一个仍开放的 session。`不是新任务` 和 `接着上一个` 不会另开 session。
+仓库里已经有骨架、传输、规则路由、session 存储，以及 DeepSeek adapter。CLI 有 `events`、`supervise`、`web`、`doctor`、`grokbot test`、`sessions list`、`sessions close`。`start.sh` 在 `[deepseek] enabled = true` 时会加上 `--extra deepseek`。没有 `DEEPSEEK_API_KEY` 时不会连接 DeepSeek，也不会崩溃。审批中心的仪表盘还没做。没有说要新任务时，继续最近一个仍开放的 session。`不是新任务` 和 `接着上一个` 不会另开 session。
 
 ```bash
 uv sync --extra dev
@@ -27,7 +27,7 @@ uv run audi28 doctor
 
 传输：Audi 不能访问本机 HTTP。任务和审批决定写成 `data/inbox/audi/*.json`。Ruoran 已批准 Audi 把 JSON 写入 `~/Code/audi28/data/inbox/audi/`（目录不存在可以建），其它 Mac 写入仍要单独批准。同一 `message_id` 只处理一次。坏 JSON、symlink 和超过 1MB 的文件会进 `quarantine/`。audi28 把要发给 Audi 的 JSON 先写入 `data/outbox/grokbot/`，再 POST 到 `AUDI28_GROKBOT_WEBHOOK_URL`。失败会留下，重启后续发。`uv run audi28 grokbot test` 发一条测试消息。CI 只用本机假 HTTP server。
 
-DeepSeek 的默认工作区是 `~/Code/deepseek-workspace`（可在 `config.toml` 里改），权限预设是 `workspace-write`。工具调用仍要审批。用户没有明确说要新任务时，继续最近一个仍开放的 session。审批和提问没有超时自动拒绝，一直等到回答。
+DeepSeek 的默认工作区是 `~/Code/deepseek-workspace`（可在 `config.toml` 里改），权限预设是 `workspace-write`。工具调用仍要审批。用户没有明确说要新任务时，继续最近一个仍开放的 session。审批和提问没有超时自动拒绝，一直等到回答。提示在会话自己的线程里跑，传输循环继续收 inbox、发 webhook。backend session id 在 `start_session()` 返回后、第一轮提示开始前就写入 session 文件。进程收到 SIGINT 或 SIGTERM，或者传输循环退出时，会关掉 DeepSeek 运行时，避免上次的 `dsh` 占着 session。
 
 ## 许可证与密钥
 
