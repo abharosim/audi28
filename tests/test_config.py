@@ -1,7 +1,5 @@
 from pathlib import Path
 
-import sys
-
 import pytest
 
 from audi28.config import ConfigError, load_config, load_dotenv
@@ -24,7 +22,7 @@ def test_example_config_loads(tmp_path, monkeypatch):
     assert cfg.deepseek.permission_mode == "workspace-write"
     assert cfg.deepseek.approval_requests is True
     assert cfg.deepseek.dsh_home == (path.parent / "data" / "dsh-home").resolve()
-    assert cfg.deepseek.sandbox.enabled is (sys.platform == "darwin")
+    assert cfg.deepseek.sandbox.enabled is False
     assert cfg.deepseek.sandbox.extra_read_paths == ()
     assert cfg.route.llm is False
     assert cfg.route.default == "deepseek"
@@ -45,6 +43,32 @@ def test_unknown_section_is_rejected(tmp_path, monkeypatch):
 
     with pytest.raises(ConfigError, match="未知 section「not-a-section」"):
         load_config(path)
+
+
+def test_sandbox_stays_off_when_enabled_is_omitted(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    text = EXAMPLE.read_text(encoding="utf-8").replace(
+        "[deepseek.sandbox]\nenabled = false\n",
+        "[deepseek.sandbox]\n",
+        1,
+    )
+    path = tmp_path / "config.toml"
+    path.write_text(text, encoding="utf-8")
+
+    assert load_config(path).deepseek.sandbox.enabled is False
+
+
+def test_sandbox_can_be_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    text = EXAMPLE.read_text(encoding="utf-8").replace(
+        "[deepseek.sandbox]\nenabled = false\n",
+        "[deepseek.sandbox]\nenabled = true\n",
+        1,
+    )
+    path = tmp_path / "config.toml"
+    path.write_text(text, encoding="utf-8")
+
+    assert load_config(path).deepseek.sandbox.enabled is True
 
 
 def test_sandbox_extra_read_path_must_be_absolute(tmp_path, monkeypatch):

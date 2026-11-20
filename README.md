@@ -35,7 +35,9 @@ uv run audi28 doctor
 ./start.sh
 ```
 
-`doctor` 每一项打 `PASS`、`WARN` 或 `FAIL`。有 `FAIL` 时退出码不是 0，并给一行可以直接复制的修法。它只说密钥有没有设置、长度是多少，不打印值。`audi28 doctor --json` 打同样的结果。
+改完代码后，在项目里执行 `touch data/restart.request`，supervisor 会自己停掉再拉起来，不用在原来的终端按 Ctrl+C。`pyproject.toml` 有变化时，它会先跑 `uv sync`。
+
+`doctor` 每一项打 `PASS`、`INFO`、`WARN` 或 `FAIL`。`INFO` 只是说明，没有修法，也不让退出码变成非 0。有 `FAIL` 时退出码不是 0，并给一行可以直接复制的修法。它只说密钥有没有设置、长度是多少，不打印值。`audi28 doctor --json` 打同样的结果。沙箱默认关闭时，这一项是 `INFO`。
 
 浏览器打开 `http://127.0.0.1:8728/?token=你的token`。登录成功后会跳回不带 token 的地址，之后靠 cookie。
 
@@ -61,7 +63,7 @@ uv run python scripts/mock_deepseek.py
 
 DeepSeek 的默认工作区是 `~/Code/deepseek-workspace`（可在 `config.toml` 里改），权限预设是 `workspace-write`。工具调用仍要审批。用户没有明确说要新任务时，继续最近一个仍开放的 session。审批和提问没有超时自动拒绝，一直等到回答。提示在会话自己的线程里跑，传输循环继续收 inbox、发 webhook。backend session id 在 `start_session()` 返回后、第一轮提示开始前就写入 session 文件。进程收到 SIGINT 或 SIGTERM，或者传输循环退出时，会关掉 DeepSeek 运行时，避免上次的 `dsh` 占着 session。
 
-macOS 上 DeepSeek 的 `dsh` 会套进 `sandbox-exec`。SDK 0.2.2rc2 只提供 `dsh_bin` 来替换运行时可执行文件，不能在它前面加命令。audi28 把 `dsh_bin` 指到 `data/sandbox/dsh-sandboxed`，这个脚本再 `exec /usr/bin/sandbox-exec -f data/sandbox/deepseek.sb` 去跑真正的 `dsh`。沙箱默认允许，然后拒绝读取和写入用户家目录，只重新放开配置的工作区、`data/dsh-home`，以及读 `.venv` 和运行时自己的文件。项目目录里的 `.env` 一律读不到，密钥只从环境变量进运行时。没有 `sandbox-exec` 的系统会记一条 WARN，然后不套沙箱继续跑。`[deepseek.sandbox] extra_read_paths` 可以再加只读目录。
+DeepSeek 的 macOS 沙箱默认关闭，所有平台都一样。在 `config.toml` 里把 `[deepseek.sandbox] enabled` 设为 `true` 之后，`dsh` 才会套进 `sandbox-exec`。SDK 0.2.2rc2 只提供 `dsh_bin` 来替换运行时可执行文件，不能在它前面加命令。启用后 audi28 把 `dsh_bin` 指到 `data/sandbox/dsh-sandboxed`，这个脚本再 `exec /usr/bin/sandbox-exec -f data/sandbox/deepseek.sb` 去跑真正的 `dsh`。沙箱默认允许，然后拒绝读取和写入用户家目录，只重新放开配置的工作区、`data/dsh-home`，以及读 `.venv` 和运行时自己的文件。项目目录里的 `.env` 一律读不到，密钥只从环境变量进运行时。没有 `sandbox-exec` 的系统会记一条 WARN，然后不套沙箱继续跑。`[deepseek.sandbox] extra_read_paths` 可以再加只读目录。`audi28 doctor` 在沙箱关闭时打 `INFO`。
 
 沙箱没关上的口子：网络仍然开着，DeepSeek 还能访问 API；`/tmp`、`/private/tmp`、`/usr`、`/System`、`/Library`、`/opt/homebrew` 这些系统路径仍可读。家目录里的 `~/.ssh` 和 `~/.aws` 读不到。
 

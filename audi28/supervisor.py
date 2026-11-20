@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
+import subprocess
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -21,14 +24,38 @@ from audi28.transport import Inbox, Outbox
 from audi28.web import WebServer
 
 
-def supervise(config: Config, *, stop: threading.Event | None = None, harness_factory=None) -> None:
-    """Run until stop is set, or until SIGINT/SIGTERM when stop is omitted."""
+def supervise(
+    config: Config,
+    *,
+    stop: threading.Event | None = None,
+    harness_factory=None,
+    reexec=None,
+    sync_runner=None,
+) -> None:
+    """Run until stop is set, or until SIGINT/SIGTERM when stop is omitted.
+
+    ``data/restart.request`` stops this process and executes it again, so a
+    code update does not need Ctrl+C. A file already present at startup is
+    removed and does not count as a new request.
+    """
 
     owns_stop = stop is None
     if stop is None:
         stop = threading.Event()
+    trigger = config.root / "data" / "restart.request"
+    trigger.parent.mkdir(parents=True, exist_ok=True)
+    trigger.unlink(missing_ok=True)
+    restarts = _restart_count()
+    last_reason = os.environ.get("AUDI28_RESTART_REASON", "")
+    restart: dict[str, object] = {"go": False, "reason": ""}
+    deps_mtime = _pyproject_mtime(config.root)
     runtime = _build_runtime(config, harness_factory)
-    _write_supervisor_state(config.root, port=config.web.port)
+    _write_supervisor_state(
+        config.root,
+        port=config.web.port,
+        restarts=restarts,
+        last_reason=last_reason,
+    )
     server = WebServer(
         config.web.host,
         config.web.port,
@@ -41,7 +68,7 @@ def supervise(config: Config, *, stop: threading.Event | None = None, harness_fa
     web_thread = threading.Thread(target=server.serve_forever, name="audi28-web")
     transport_thread = threading.Thread(
         target=_run_transport,
-        args=(runtime, config, stop),
+        args=(runtime, config, stop, restart),
         name="audi28-transport",
         daemon=True,
     )
@@ -58,6 +85,16 @@ def supervise(config: Config, *, stop: threading.Event | None = None, harness_fa
         web_thread.join(timeout=5)
         transport_thread.join(timeout=8)
         _clear_supervisor_state(config.root)
+        if restart["go"]:
+            _reexec_supervisor(
+                config,
+                runtime,
+                reason=str(restart["reason"]),
+                restarts=restarts,
+                deps_mtime=deps_mtime,
+                reexec=reexec,
+                sync_runner=sync_runner,
+            )
 
 
 class _Runtime:
@@ -144,8 +181,14 @@ def _transport_loop(config: Config, stop: threading.Event, harness_factory=None)
     _run_transport(_build_runtime(config, harness_factory), config, stop)
 
 
-def _run_transport(runtime: _Runtime, config: Config, stop: threading.Event) -> None:
+def _run_transport(
+    runtime: _Runtime,
+    config: Config,
+    stop: threading.Event,
+    restart: dict[str, object] | None = None,
+) -> None:
     announced = False
+    trigger = config.root / "data" / "restart.request"
     try:
         while not stop.is_set():
             try:
@@ -160,19 +203,26 @@ def _run_transport(runtime: _Runtime, config: Config, stop: threading.Event) -> 
                 runtime.center.remind_due(config.approval.remind_after_s)
                 runtime.backend.deliver_decisions()
                 runtime.outbox.flush_once()
-                _write_supervisor_state(config.root, port=config.web.port)
+                _write_supervisor_state(
+                    config.root,
+                    port=config.web.port,
+                    restarts=_restart_count(),
+                    last_reason=os.environ.get("AUDI28_RESTART_REASON", ""),
+                )
             except Exception as exc:
                 # Keep the dashboard up, but do not hide the failure.
                 _record_loop_error(
                     runtime.events,
                     exc,
-                    secrets=(
-                        runtime.url,
-                        runtime.key,
-                        os.environ.get("AUDI28_DASHBOARD_TOKEN", "").strip(),
-                        os.environ.get("DEEPSEEK_API_KEY", "").strip(),
-                    ),
+                    secrets=_secret_values(runtime),
                 )
+            if restart is not None:
+                reason = _take_restart(trigger)
+                if reason is not None:
+                    restart["go"] = True
+                    restart["reason"] = reason
+                    stop.set()
+                    return
             stop.wait(config.inbox.poll_s)
     finally:
         runtime.backend.close()
@@ -194,13 +244,15 @@ def _home_dir() -> Path:
     return Path(os.environ.get("HOME") or str(Path.home())).expanduser()
 
 
-def _write_supervisor_state(root: Path, *, port: int) -> None:
+def _write_supervisor_state(root: Path, *, port: int, restarts: int = 0, last_reason: str = "") -> None:
     path = root / "data" / "supervisor.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "pid": os.getpid(),
         "heartbeat": datetime.now().astimezone().isoformat(timespec="seconds"),
         "port": port,
+        "restarts": restarts,
+        "last_reason": last_reason,
     }
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload) + "\n", encoding="utf-8")
@@ -212,6 +264,99 @@ def _clear_supervisor_state(root: Path) -> None:
         (root / "data" / "supervisor.json").unlink()
     except FileNotFoundError:
         return
+
+
+def _take_restart(trigger: Path) -> str | None:
+    if not trigger.is_file():
+        return None
+    try:
+        reason = trigger.read_text(encoding="utf-8").strip()[:200]
+    except OSError:
+        reason = ""
+    try:
+        trigger.unlink()
+    except FileNotFoundError:
+        pass
+    return reason
+
+
+def _reexec_supervisor(
+    config: Config,
+    runtime: _Runtime,
+    *,
+    reason: str,
+    restarts: int,
+    deps_mtime: float,
+    reexec,
+    sync_runner,
+) -> None:
+    cleaned = _redact_secrets(reason, _secret_values(runtime))[:200]
+    os.environ["AUDI28_RESTARTS"] = str(restarts + 1)
+    os.environ["AUDI28_RESTART_REASON"] = cleaned
+    try:
+        runtime.events.append(
+            type="supervisor",
+            source="supervisor",
+            ref=None,
+            data={"action": "restart", "reason": cleaned},
+        )
+    except Exception:
+        pass
+    _sync_dependencies(config, deps_mtime, sync_runner)
+    if reexec is None:
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+        return
+    reexec()
+
+
+def _sync_dependencies(config: Config, deps_mtime: float, sync_runner) -> None:
+    if _pyproject_mtime(config.root) == deps_mtime:
+        return
+    command = ["uv", "sync", "--extra", "dev"]
+    if config.deepseek.enabled:
+        command.extend(["--extra", "deepseek"])
+    if sync_runner is not None:
+        sync_runner(command, config.root)
+        return
+    if shutil.which("uv") is None:
+        return
+    subprocess.run(command, cwd=config.root, check=False)
+
+
+def _pyproject_mtime(root: Path) -> float:
+    path = root / "pyproject.toml"
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _restart_count() -> int:
+    raw = os.environ.get("AUDI28_RESTARTS", "0").strip()
+    if raw.isdigit():
+        return int(raw)
+    return 0
+
+
+def _secret_values(runtime: _Runtime) -> tuple[str, ...]:
+    return tuple(
+        value
+        for value in (
+            runtime.url,
+            runtime.key,
+            os.environ.get("AUDI28_DASHBOARD_TOKEN", "").strip(),
+            os.environ.get("DEEPSEEK_API_KEY", "").strip(),
+        )
+        if value
+    )
+
+
+def _redact_secrets(text: str, secrets: tuple[str, ...]) -> str:
+    cleaned = text
+    for secret in sorted(secrets, key=len, reverse=True):
+        if len(secret) >= 4:
+            cleaned = cleaned.replace(secret, "[redacted]")
+    return cleaned
 
 
 def _record_loop_error(events: EventLog, exc: Exception, *, secrets: tuple[str, ...]) -> None:

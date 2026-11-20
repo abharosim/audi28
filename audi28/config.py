@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -322,7 +321,7 @@ def _deepseek(table: Mapping[str, object], root: Path) -> DeepSeekConfig:
 
 def _sandbox(value: object, root: Path) -> SandboxConfig:
     if value is None:
-        return SandboxConfig(enabled=sys.platform == "darwin", extra_read_paths=())
+        return SandboxConfig(enabled=False, extra_read_paths=())
     if not isinstance(value, dict):
         raise ConfigError("deepseek.sandbox 必须是一张表。")
     unknown = sorted(set(value) - {"enabled", "extra_read_paths"})
@@ -331,7 +330,7 @@ def _sandbox(value: object, root: Path) -> SandboxConfig:
     if "enabled" in value:
         enabled = _require_bool("deepseek.sandbox", "enabled", value["enabled"])
     else:
-        enabled = sys.platform == "darwin"
+        enabled = False
     raw_paths = value.get("extra_read_paths", [])
     if not isinstance(raw_paths, list):
         raise ConfigError("deepseek.sandbox.extra_read_paths 必须是路径列表。")

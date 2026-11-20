@@ -77,6 +77,11 @@ def test_ready_environment_passes_without_printing_secrets(tmp_path, monkeypatch
     assert checks["deepseek-sdk"].status == "PASS"
     assert checks["dsh"].status == "PASS"
     assert checks["workspace"].status == "PASS"
+    assert checks["sandbox"].status == "INFO"
+    assert "默认关闭" in checks["sandbox"].detail
+    assert "WARN sandbox:" not in report.text
+    assert "INFO sandbox:" in report.text
+    assert "fix:" not in report.text.split("INFO sandbox:", 1)[1].split("\n", 1)[0]
     assert checks["sessions"].detail.startswith("0 ")
 
 
