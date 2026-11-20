@@ -38,6 +38,7 @@ def test_profile_denies_home_and_project_env_but_allows_workspace(tmp_path):
         '(allow file-read* file-write* (subpath "/Users/rowang/Code/audi28/data/dsh-home"))'
     )
     env_deny = text.index('(deny file-read* file-write* (literal "/Users/rowang/Code/audi28/.env"))')
+    assert text.index('(subpath "/private/var/folders")') < home_deny
     assert home_deny < workspace_allow < env_deny
     assert home_deny < dsh_allow < env_deny
     assert '(allow default)' in text

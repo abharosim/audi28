@@ -61,16 +61,18 @@ def render_profile(
     """SBPL profile. Last matching rule wins, so allows come after the home deny."""
 
     home_path = home.expanduser().resolve()
+    # Last matching rule wins. Broad temp allows come first so a home that
+    # happens to live under /var/folders is still denied afterwards.
     lines = [
         "(version 1)",
         "(allow default)",
-        f"(deny file-read* (subpath {_quote(home_path)}))",
-        f"(deny file-write* (subpath {_quote(home_path)}))",
     ]
     for path in _SYSTEM_READ:
         lines.append(f"(allow file-read* (subpath {_quote(Path(path))}))")
     for path in (*temp_paths, *_default_temps()):
         lines.append(f"(allow file-read* file-write* (subpath {_quote(path)}))")
+    lines.append(f"(deny file-read* (subpath {_quote(home_path)}))")
+    lines.append(f"(deny file-write* (subpath {_quote(home_path)}))")
     lines.append(f"(allow file-read* file-write* (subpath {_quote(workspace)}))")
     lines.append(f"(allow file-read* file-write* (subpath {_quote(dsh_home)}))")
     read_only = [project_root / ".venv" if venv is None else venv]
