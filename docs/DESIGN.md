@@ -1,6 +1,6 @@
 # audi28 设计文档
 
-> 状态：2026-11-20 的决定已写入正文。Phase 1 的骨架（配置、事件日志、CLI、占位仪表盘）已在本仓库；传输、router、session 存储、DeepSeek adapter、审批中心尚未实现。
+> 状态：2026-11-20 的决定已写入正文。Phase 1 的骨架和传输已在本仓库；router、session 存储、DeepSeek adapter、审批中心尚未实现。
 > 日期：2026-11-19 起草（America/New_York），2026-11-20 按 Ruoran 的决定改定。
 > 项目位置：Mac 上 `~/Code/audi28`，与 `~/Code/audi27` 并列。本仓库就是这份实现。
 
@@ -72,7 +72,7 @@ audi28 是**独立服务**。两者可以同机并列运行，通过文件或本
 
 说明：DaDa 文档和 TypeScript 示例用的是 `client.onRequest(...)`。Python 镜像同一套协议，但公开 API 是 `next_request()` + `respond()`，外加独立的 `on_user_question`。audi28 按 Python API 写，不要照抄 TS 回调签名。
 
-Phase 1 用完整 `sdk` profile（需要权限预设），`dsh_home` 放在项目下的 `data/dsh-home`，不要用 `~/.dsh`。默认权限 `workspace-write`，并打开 `approval_requests`，这样写操作仍要经过审批中心。不要在 Phase 1 使用 `danger-full-access` 或 headless 的 `--approval-policy never`。
+Phase 1 用完整 `sdk` profile（需要权限预设），`dsh_home` 放在项目下的 `data/dsh-home`，不要用 `~/.dsh`。默认权限 `workspace-write`，并打开 `approval_requests`，这样写操作仍要经过审批中心。加载配置时只接受 `read-only` 和 `workspace-write`，拒绝 `danger-full-access` 以及其它值。也不要使用 headless 的 `--approval-policy never`。
 
 默认 workspace 是 `~/Code/deepseek-workspace`，写在 `config.toml` 的 `[deepseek] workspace`，可以改成另一个目录。加载配置时把 `~` 展开成绝对路径。没写 workspace，或写成相对路径，都是配置错误，不会悄悄改用 `$HOME` 下的别的目录。`workspace-write` 只划定 DeepSeek 能碰到的目录；每一次工具调用仍然进入审批中心。
 
@@ -155,6 +155,22 @@ Ruoran 已同意下面这一条，且只同意这一条。实现时不要扩大�
 > Allow Audi to copy JSON files from its box into `~/Code/audi28/data/inbox/audi/` on my Mac (machine 806b8af2), creating that folder if needed, without asking; any other write on my Mac still needs my approval.
 
 `processed/`、`quarantine/` 由本机 audi28 进程移动，不需要这条规则。密钥和 URL 仍只放 `.env`，不进 `config.toml`，也不进事件或日志。
+
+### 传输行为
+
+Inbox 根目录是 `data/inbox/audi/`。watcher 只认这里的 `*.json`，不跟随 symlink，也不把子目录里的文件再当新任务。
+
+领取是原子的：把文件 `rename` 到 `processing/`。两个进程同时看到同一个文件时，只有一个 rename 成功。然后：
+
+- 是 symlink，或大小超过 `[inbox] max_bytes`：立刻移到 `quarantine/`，不读链接目标，也不把文件正文读进内存。记一条 `error`。
+- JSON 解析失败，或解析结果不是对象，或缺少非空字符串 `kind` / `message_id`：留在 `processing/`，按 `[inbox] parse_retries` 个 tick 再试。用尽后移到 `quarantine/`，记一条 `error`。
+- 合法文件：`message_id` 已经有过 `inbox_received` 就不再处理第二次，文件直接进 `processed/`，另记一条 `error` 说明是重复。否则先追加 `inbox_received`（`source` 为 `inbox`，`ref` 为 `message_id`，`data.message` 是原文），再移到 `processed/`。事件里不写绝对路径。文件里若还有 `idempotency_key`，同一个 key 也只处理一次。
+
+出站先落在 `data/outbox/grokbot/pending/`，再 POST。发送前原子地改名为 `inflight/`，成功后进入 `sent/`。进程在 `inflight/` 里重启的话，下一次 flush 把文件放回 `pending/` 再发。URL 和 key 只来自 `AUDI28_GROKBOT_WEBHOOK_URL` 和 `AUDI28_GROKBOT_WEBHOOK_KEY`。它们不进 outbox 文件、事件或日志。缺其中任何一个时不发请求，pending 原样留着。
+
+同一次 flush 里，网络错误或超时按短退避再试一次。仍然失败就记 `error`，文件回到 pending，并推迟下一次尝试，避免 supervisor 空转时打满对端。非 2xx 不在同一次 flush 里重试，同样记 `error` 并留在 pending，重启后还会再试。2xx 记一条 `webhook` 事件（`status` 为 `sent`）。入队时另记一条 `webhook`（`status` 为 `queued`）。成功和失败的事件都不含 URL、key 或 Authorization 头。
+
+`audi28 grokbot test` 用当前环境把一条测试消息走这套 outbox。测试和 CI 只打本机假 HTTP server，不访问真实 webhook。
 
 ## 8. Session 模型
 
@@ -431,7 +447,7 @@ webhook 体（audi28 → Audi）：
 - 仪表盘和以后的 hook HTTP 只绑 `127.0.0.1`，不绑 `0.0.0.0`。
 - webhook 和（以后）hook 端点使用 token。Token 只来自环境变量 / `.env`。Claude Code 的 hook header 用 `allowedEnvVars`，不要把 token 写进仓库里的 `settings.json`。
 - Phase 1 不对写文件、shell、插件安装、git、工作区以外的路径做 auto-approve。
-- 默认权限预设是 `workspace-write`，不是 `danger-full-access`。工具调用仍要经过审批。workspace 默认是 `~/Code/deepseek-workspace`，写在 `config.toml` 里；加载时把 `~` 展开成绝对路径。没写、或写成相对路径，都是配置错误，不会悄悄改用 `$HOME` 下的另一个目录。
+- 默认权限预设是 `workspace-write`。加载时只接受 `read-only` 和 `workspace-write`，拒绝 `danger-full-access`。工具调用仍要经过审批。workspace 默认是 `~/Code/deepseek-workspace`，写在 `config.toml` 里；加载时把 `~` 展开成绝对路径。没写、或写成相对路径，都是配置错误，不会悄悄改用 `$HOME` 下的另一个目录。
 - 日志和事件做 redact（URL、key）。inbox 不跟随 symlink。
 - DeepSeek 的 `dsh_home` 隔离在项目 `data/` 下。
 - 本机写 API（若仪表盘以后要批准按钮）必须要求 JSON、loopback Host，并拒绝跨站 `Sec-Fetch-Site`（对齐 audi27 的 `/api/confirm`）。
@@ -439,7 +455,7 @@ webhook 体（audi28 → Audi）：
 ## 15. 目录布局（实现时）
 
 ```
-~/Code/audi28/                 # 与 audi27 并列；本设计稿目前在 box 的 /workspace/audi28/
+~/Code/audi28/                 # 与 audi27 并列。仓库：https://github.com/abharosim/audi28
   README.md
   AGENTS.md
   .gitignore
@@ -472,7 +488,8 @@ webhook 体（audi28 → Audi）：
   tests/
   data/                        # gitignore；运行时
     events/YYYY-MM-DD.jsonl
-    inbox/audi/{processed,quarantine}/
+    inbox/audi/{processing,processed,quarantine}/
+    outbox/grokbot/{pending,inflight,sent}/
     sessions/
     dsh-home/
     audi28.log
@@ -486,7 +503,7 @@ Phase 1 代码按上面拆模块，但每个 PR 只交能独立验证的一小�
 
 **PR 1 — 骨架。** `pyproject.toml`（Python ≥ 3.10，uv，dev extra 里有 pytest）、`config` 加载器（未知 section 报错）、`events`（append / follow / replay，与 audi27 字段一致）、`cli`（`events`、`supervise`、`web`、`doctor`）、`supervisor`、`start.sh`、`config.example.toml`、`.gitignore`（`.env`、`data/`、`.venv`）、GitHub Actions 跑 `pytest`。`doctor` 在缺少 `DEEPSEEK_API_KEY` 时说明怎么补，并且不崩溃；其它 doctor 检查仍留在 PR 6。验收：`uv sync --extra dev` 后 `pytest` 通过；能 append 并 replay 一条事件；`start.sh` 能拉起 web 在 `127.0.0.1:8728`；伪造的未知 event type 被保存而不是丢弃。
 
-**PR 2 — 传输。** inbox watcher 与 webhook 客户端（超时、一次网络重试、redact、quarantine、幂等 `message_id`）。`audi28 grokbot test` 同类命令。验收：向临时目录写入合法 `task` 文件会得到 `inbox_received` 事件并移到 `processed/`；坏 JSON 在重试后进入 `quarantine/`；symlink 和超大文件被隔离；用本地 HTTP server 测 webhook：2xx 成功，非 2xx 和超时记 `error` 且日志无密钥。
+**PR 2 — 传输。** 行为见第 7 节「传输行为」：inbox 原子领取、按 `message_id` 幂等、坏文件隔离、webhook outbox（短退避、重启后续发）、每次收发都写事件。`audi28 grokbot test`。验收：向临时目录写入合法 `task` 文件会得到 `inbox_received` 事件并移到 `processed/`；坏 JSON 在重试后进入 `quarantine/`；symlink 和超大文件被隔离；用本地 HTTP server 测 webhook：2xx 成功，非 2xx 和超时记 `error` 且日志无密钥。CI 不访问真实 webhook。
 
 **PR 3 — Router 与 session 存储。** 第 9 节的规则路由 + `data/sessions` 的 CRUD、list、close。验收：fixtures 覆盖显式 `self`、显式 `deepseek`、默认 `deepseek`；正文含「新任务」时 `session_action=new` 并写下 reason；否则继续最近一个仍开放的 session；没有可继续的 session 时才新开，reason 说明原因；重启后 session 文件仍在；关闭后的 id 拒绝新 task；`route` 事件带 reason，并能用 `ref` 串回 inbox 消息。
 

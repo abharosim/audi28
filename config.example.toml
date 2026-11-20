@@ -26,7 +26,7 @@ max_bytes = 1048576          # 超过则隔离，不跟随 symlink
 [grokbot]
 header_name = "Authorization"
 header_value = "Bearer {key}"
-timeout_s = 10               # POST 超时；仅网络错误重试一次
+timeout_s = 10               # POST 超时。网络错误或超时在同一次 flush 里按短退避再试一次。
 # 这是 webhook 的 HTTP 超时，不是审批超时。审批没有超时，见 [approval]。
 
 [route]
@@ -65,4 +65,3 @@ initialize_timeout_seconds = 30
 [hooks]
 enabled = false
 token_env = "AUDI28_HOOK_TOKEN"
-# path = "/approve"

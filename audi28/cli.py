@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
-from audi28.config import ConfigError, prepare
+from audi28.config import Config, ConfigError, prepare
 from audi28.doctor import doctor_report
 from audi28.events import EventLog, EventLogError
 from audi28.supervisor import supervise
+from audi28.transport import Outbox
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -25,6 +27,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("supervise", help="run the local dashboard until signaled")
     sub.add_parser("web", help="run the local dashboard until signaled")
     sub.add_parser("doctor", help="check config and DEEPSEEK_API_KEY")
+    grokbot = sub.add_parser("grokbot", help="talk to the Grok Bot webhook")
+    grokbot_sub = grokbot.add_subparsers(dest="grokbot_command", required=True)
+    grokbot_sub.add_parser("test", help="send one test message through the outbox")
 
     args = parser.parse_args(_normalize_argv(argv))
     config_path = args.config or (Path.cwd() / "config.toml")
@@ -42,6 +47,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "events":
         return _replay(config.root / "data" / "events")
+    if args.command == "grokbot":
+        return _grokbot_test(config)
     supervise(config)
     return 0
 
@@ -73,6 +80,35 @@ def _normalize_argv(argv: list[str] | None) -> list[str] | None:
     if not config:
         return rest
     return config + rest
+
+
+def _grokbot_test(config: Config) -> int:
+    url = os.environ.get("AUDI28_GROKBOT_WEBHOOK_URL", "").strip()
+    key = os.environ.get("AUDI28_GROKBOT_WEBHOOK_KEY", "").strip()
+    if not url or not key:
+        print(
+            "没有找到 AUDI28_GROKBOT_WEBHOOK_URL 或 AUDI28_GROKBOT_WEBHOOK_KEY。"
+            "写进项目根目录的 .env，或导出到环境变量。"
+        )
+        return 1
+    events = EventLog(config.root / "data" / "events")
+    outbox = Outbox(
+        config.root / "data" / "outbox" / "grokbot",
+        events,
+        url=url,
+        key=key,
+        header_name=config.grokbot.header_name,
+        header_value=config.grokbot.header_value,
+        timeout_s=config.grokbot.timeout_s,
+        secrets=(url, key),
+    )
+    outbox.enqueue({"kind": "test", "text": "audi28 grokbot test"})
+    outbox.flush_once()
+    if list((outbox.root / "sent").glob("*.json")):
+        print("webhook 测试已发送。")
+        return 0
+    print("webhook 测试没有发送成功。")
+    return 1
 
 
 def _replay(directory: Path) -> int:

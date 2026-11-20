@@ -138,6 +138,40 @@ def test_missing_dotenv_is_fine(tmp_path):
     assert env == {}
 
 
+def test_danger_full_access_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    text = EXAMPLE.read_text(encoding="utf-8").replace(
+        'permission_mode = "workspace-write"',
+        'permission_mode = "danger-full-access"',
+        1,
+    )
+    path = tmp_path / "config.toml"
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="danger-full-access"):
+        load_config(path)
+
+
+def test_read_only_permission_mode_is_allowed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    text = EXAMPLE.read_text(encoding="utf-8").replace(
+        'permission_mode = "workspace-write"',
+        'permission_mode = "read-only"',
+        1,
+    )
+    path = tmp_path / "config.toml"
+    path.write_text(text, encoding="utf-8")
+
+    cfg = load_config(path)
+
+    assert cfg.deepseek.permission_mode == "read-only"
+
+
+def test_example_does_not_advertise_an_unknown_hooks_path():
+    text = EXAMPLE.read_text(encoding="utf-8")
+    assert 'path = "/approve"' not in text
+
+
 def test_load_config_does_not_require_api_key(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
