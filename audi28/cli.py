@@ -28,7 +28,8 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("supervise", help="run the local dashboard until signaled")
     sub.add_parser("web", help="run the local dashboard until signaled")
-    sub.add_parser("doctor", help="check config and DEEPSEEK_API_KEY")
+    doctor = sub.add_parser("doctor", help="check whether audi28 can start")
+    doctor.add_argument("--json", action="store_true", help="print the checks as JSON")
     grokbot = sub.add_parser("grokbot", help="talk to the Grok Bot webhook")
     grokbot_sub = grokbot.add_subparsers(dest="grokbot_command", required=True)
     grokbot_sub.add_parser("test", help="send one test message through the outbox")
@@ -49,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     config_path = args.config or (Path.cwd() / "config.toml")
 
     if args.command == "doctor":
-        report = doctor_report(config_path)
+        report = doctor_report(config_path, as_json=bool(getattr(args, "json", False)))
         sys.stdout.write(report.text)
         return report.exit_code
 

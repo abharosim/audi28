@@ -25,7 +25,7 @@ audi28 是本机的 agent 会话层和统一审批中心。用户通过 Audi（G
 
 - 三个工具（DeepSeek、Claude Code、Codex）共用规范化的 `ApprovalRequest` / `ApprovalDecision`。新 adapter 只做映射，不另做一套状态机。
 - Phase 1 不对写文件、shell、装包、git、工作区以外的路径做 auto-approve。pending 的审批和提问一直等到用户回答，不因为超时自动拒绝；重启后仍在，可以再次提醒，仪表盘上看得到。可选 `remind_after_s` 不写就关闭，到点只再问一次，不改成拒绝。仪表盘除 `/health` 外要 `AUDI28_DASHBOARD_TOKEN`。
-- 发给用户的 `spoken_text` 必须带来源，例如「DeepSeek 在问你：…」。口述不要包含路径、URL 或 token。
+- 发给用户的 `spoken_text` 必须带来源，例如「DeepSeek 在问你：…」。口述不要包含路径、URL 或 token。`doctor` 和监督循环的错误记录同样不打印密钥的值。
 
 ## 传输
 

@@ -1,6 +1,6 @@
 # audi28 设计文档
 
-> 状态：2026-11-20 的决定已写入正文。Phase 1 的骨架、传输、规则路由、session 存储、DeepSeek adapter，以及审批中心和本机仪表盘已在本仓库。Claude Code 与 Codex 的 hook 适配器还没做。
+> 状态：2026-11-20 的决定已写入正文。Phase 1 的骨架、传输、规则路由、session 存储、DeepSeek adapter、审批中心、本机仪表盘和 `audi28 doctor` 已在本仓库。Claude Code 与 Codex 的 hook 适配器还没做。
 > 日期：2026-11-19 起草（America/New_York），2026-11-20 按 Ruoran 的决定改定。
 > 项目位置：Mac 上 `~/Code/audi28`，与 `~/Code/audi27` 并列。本仓库就是这份实现。
 
@@ -524,7 +524,7 @@ Phase 1 代码按上面拆模块，但每个 PR 只交能独立验证的一小�
 4. 没有 decision 时不会变成 `rejected`。进程重启后这条审批仍是 pending，仪表盘列得出，启动时会再次通知 Audi。
 5. 重复的 `idempotency_key` 不向用户问第二次。
 
-**PR 6 — `doctor` 与文档抛光。** 骨架已经会在密钥缺失时给出补法，且不打印密钥的值。这一步补上：SDK import、`dsh_home`、inbox 可写、supervisor / 运行时 liveness、最近错误。README 补充如何配置 webhook routine。Allow rule 已批准，见第 7 节。
+**PR 6 — `doctor` 与文档抛光。** `audi28 doctor` 对 Python、uv、钉住的 SDK、`dsh`、密钥（只报有没有和长度）、工作区、webhook、仪表盘 token、目录、进程心跳、`/health`、待审批、开放 session 和最近一条 error 打 `PASS` / `WARN` / `FAIL`。有 `FAIL` 就非 0 退出。不打印密钥。`--json` 打同样的结果。没有真实密钥时用 `scripts/mock_deepseek.py` 跑进程内假 DeepSeek。Allow rule 已批准，见第 7 节。
 
 ### 之后的阶段（不在本次实现范围）
 

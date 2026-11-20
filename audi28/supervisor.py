@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import threading
+from datetime import datetime
+from pathlib import Path
 
 from audi28.adapters.deepseek import DeepSeekBackend
 from audi28.approval import ApprovalCenter
@@ -17,13 +20,14 @@ from audi28.transport import Inbox, Outbox
 from audi28.web import WebServer
 
 
-def supervise(config: Config, *, stop: threading.Event | None = None) -> None:
+def supervise(config: Config, *, stop: threading.Event | None = None, harness_factory=None) -> None:
     """Run until stop is set, or until SIGINT/SIGTERM when stop is omitted."""
 
     owns_stop = stop is None
     if stop is None:
         stop = threading.Event()
-    runtime = _build_runtime(config)
+    runtime = _build_runtime(config, harness_factory)
+    _write_supervisor_state(config.root, port=config.web.port)
     server = WebServer(
         config.web.host,
         config.web.port,
@@ -52,6 +56,7 @@ def supervise(config: Config, *, stop: threading.Event | None = None) -> None:
         server.shutdown()
         web_thread.join(timeout=5)
         transport_thread.join(timeout=8)
+        _clear_supervisor_state(config.root)
 
 
 class _Runtime:
@@ -143,9 +148,19 @@ def _run_transport(runtime: _Runtime, config: Config, stop: threading.Event) -> 
                 runtime.center.remind_due(config.approval.remind_after_s)
                 runtime.backend.deliver_decisions()
                 runtime.outbox.flush_once()
+                _write_supervisor_state(config.root, port=config.web.port)
             except Exception as exc:
                 # Keep the dashboard up, but do not hide the failure.
-                _record_loop_error(runtime.events, exc, secrets=(runtime.url, runtime.key))
+                _record_loop_error(
+                    runtime.events,
+                    exc,
+                    secrets=(
+                        runtime.url,
+                        runtime.key,
+                        os.environ.get("AUDI28_DASHBOARD_TOKEN", "").strip(),
+                        os.environ.get("DEEPSEEK_API_KEY", "").strip(),
+                    ),
+                )
             stop.wait(config.inbox.poll_s)
     finally:
         runtime.backend.close()
@@ -161,6 +176,26 @@ def _messages_to_dispatch(inbox: Inbox) -> list[dict]:
         seen.add(message_id)
         chosen.append(message)
     return chosen
+
+
+def _write_supervisor_state(root: Path, *, port: int) -> None:
+    path = root / "data" / "supervisor.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": os.getpid(),
+        "heartbeat": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "port": port,
+    }
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _clear_supervisor_state(root: Path) -> None:
+    try:
+        (root / "data" / "supervisor.json").unlink()
+    except FileNotFoundError:
+        return
 
 
 def _record_loop_error(events: EventLog, exc: Exception, *, secrets: tuple[str, ...]) -> None:
