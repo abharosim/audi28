@@ -1,6 +1,8 @@
 import json
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -9,7 +11,7 @@ from pathlib import Path
 
 from audi28.config import load_config
 from audi28.events import EventLog
-from audi28.supervisor import supervise
+from audi28.supervisor import _join_workers, _sync_dependencies, restart_argv, supervise
 from tests.conftest import write_config
 
 SECRET = "sk-restart-secret"
@@ -36,15 +38,25 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _start(tmp_path: Path, monkeypatch, *, reexec, sync_runner=None):
+def _start(tmp_path: Path, monkeypatch, *, reexec, sync_runner=None, rewrite=None):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("DEEPSEEK_API_KEY", SECRET)
     monkeypatch.setenv("AUDI28_RESTARTS", "2")
     port = _free_port()
-    config = load_config(write_config(tmp_path, port=port))
+    path = write_config(tmp_path, port=port)
+    if rewrite is not None:
+        path.write_text(rewrite(path.read_text(encoding="utf-8")), encoding="utf-8")
+    config = load_config(path)
     stop = threading.Event()
     thread = threading.Thread(
-        target=lambda: supervise(config, stop=stop, reexec=reexec, sync_runner=sync_runner),
+        target=lambda: supervise(
+            config,
+            stop=stop,
+            reexec=reexec,
+            sync_runner=sync_runner,
+            config_path=path,
+        ),
+        daemon=True,
     )
     thread.start()
     _wait_health(port)
@@ -57,7 +69,7 @@ def test_stale_restart_request_is_dropped_and_a_normal_stop_does_not_reexec(tmp_
     trigger.parent.mkdir(parents=True)
     trigger.write_text("leftover\n", encoding="utf-8")
 
-    _config, stop, thread, port = _start(tmp_path, monkeypatch, reexec=lambda: calls.append("reexec"))
+    _config, stop, thread, port = _start(tmp_path, monkeypatch, reexec=lambda _argv: calls.append("reexec"))
     try:
         assert not trigger.exists()
         assert calls == []
@@ -78,7 +90,8 @@ def test_restart_request_reexecs_and_syncs_when_pyproject_changes(tmp_path, monk
     project = tmp_path / "pyproject.toml"
     project.write_text("[project]\nname = 'before'\n", encoding="utf-8")
 
-    def reexec() -> None:
+    def reexec(argv: list[str]) -> None:
+        seen["argv"] = " ".join(argv)
         seen["restarts"] = os.environ.get("AUDI28_RESTARTS", "")
         seen["reason"] = os.environ.get("AUDI28_RESTART_REASON", "")
 
@@ -97,10 +110,14 @@ def test_restart_request_reexecs_and_syncs_when_pyproject_changes(tmp_path, monk
 
     assert thread.is_alive() is False
     assert seen["restarts"] == "3"
+    assert seen["argv"] == " ".join(restart_argv(config.root / "config.toml"))
+    assert seen["argv"].split()[0] == sys.executable
     assert SECRET not in seen["reason"]
     assert seen["reason"].startswith("更新代码 [redacted]")
     assert len(seen["reason"]) <= 200
-    assert synced == [(["uv", "sync", "--extra", "dev", "--extra", "deepseek"], config.root)]
+    assert synced == [(["uv", "sync", "--extra", "deepseek"], config.root)]
+    assert "--extra" in synced[0][0]
+    assert "dev" not in synced[0][0]
     assert not (config.root / "data" / "restart.request").exists()
     assert not (config.root / "data" / "supervisor.json").exists()
     events = EventLog(config.root / "data" / "events").replay()
@@ -120,7 +137,7 @@ def test_restart_without_a_pyproject_change_skips_uv_sync(tmp_path, monkeypatch)
     _config, _stop, thread, _port = _start(
         tmp_path,
         monkeypatch,
-        reexec=lambda: None,
+        reexec=lambda _argv: None,
         sync_runner=lambda command, cwd: synced.append(command),
     )
     (tmp_path / "data" / "restart.request").write_text("接着跑\n", encoding="utf-8")
@@ -128,3 +145,71 @@ def test_restart_without_a_pyproject_change_skips_uv_sync(tmp_path, monkeypatch)
 
     assert thread.is_alive() is False
     assert synced == []
+
+
+def test_disabled_deepseek_sync_omits_the_extra(tmp_path, monkeypatch):
+    synced: list[list[str]] = []
+    project = tmp_path / "pyproject.toml"
+    project.write_text("[project]\nname = 'before'\n", encoding="utf-8")
+
+    def disable(text: str) -> str:
+        return text.replace("[deepseek]\nenabled = true\n", "[deepseek]\nenabled = false\n", 1)
+
+    config, _stop, thread, _port = _start(
+        tmp_path,
+        monkeypatch,
+        reexec=lambda _argv: None,
+        sync_runner=lambda command, cwd: synced.append(command),
+        rewrite=disable,
+    )
+    assert config.deepseek.enabled is False
+    project.write_text("[project]\nname = 'after'\n", encoding="utf-8")
+    later = time.time() + 5
+    os.utime(project, (later, later))
+    (tmp_path / "data" / "restart.request").write_text("关掉 extra\n", encoding="utf-8")
+    thread.join(timeout=5)
+
+    assert thread.is_alive() is False
+    assert synced == [["uv", "sync"]]
+
+
+def test_missing_uv_and_failed_sync_are_recorded(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    config = load_config(write_config(tmp_path))
+    (tmp_path / "pyproject.toml").write_text("name = 'x'\n", encoding="utf-8")
+    events = EventLog(tmp_path / "events")
+    monkeypatch.setattr("audi28.supervisor.shutil.which", lambda _name: None)
+
+    _sync_dependencies(config, 0.0, None, events)
+
+    monkeypatch.setattr("audi28.supervisor.shutil.which", lambda _name: "/usr/bin/uv")
+
+    def failed(command, cwd, check=False):
+        del cwd, check
+        return subprocess.CompletedProcess(command, 7)
+
+    monkeypatch.setattr("audi28.supervisor.subprocess.run", failed)
+    _sync_dependencies(config, 0.0, None, events)
+
+    reasons = [event.data["reason"] for event in events.replay() if event.type == "error"]
+    assert any("找不到 uv" in reason for reason in reasons)
+    assert any("退出码 7" in reason for reason in reasons)
+
+
+def test_join_timeout_records_the_threads_that_are_still_alive(tmp_path):
+    events = EventLog(tmp_path / "events")
+    hold = threading.Event()
+    web = threading.Thread(target=hold.wait, daemon=True)
+    transport = threading.Thread(target=hold.wait, daemon=True)
+    web.start()
+    transport.start()
+
+    _join_workers(web, transport, events, timeout=0.05)
+
+    reasons = [event.data["reason"] for event in events.replay() if event.type == "error"]
+    assert len(reasons) == 1
+    assert "web" in reasons[0]
+    assert "transport" in reasons[0]
+    hold.set()
+    web.join(timeout=1)
+    transport.join(timeout=1)

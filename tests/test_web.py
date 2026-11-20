@@ -48,6 +48,29 @@ def test_health_on_loopback():
     assert thread.is_alive() is False
 
 
+def test_shutdown_returns_while_a_client_is_still_connected():
+    server = WebServer("127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        _wait_health(server.port)
+        held = socket.create_connection(("127.0.0.1", server.port), timeout=1)
+        held.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+        started = time.time()
+        server.shutdown()
+        assert time.time() - started < 3
+    finally:
+        thread.join(timeout=2)
+    assert thread.is_alive() is False
+    rebound = socket.socket()
+    try:
+        rebound.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        rebound.bind(("127.0.0.1", server.port))
+    finally:
+        rebound.close()
+        held.close()
+
+
 def test_rejects_non_loopback():
     with pytest.raises(ValueError, match="127.0.0.1"):
         WebServer("0.0.0.0", 0)

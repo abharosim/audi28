@@ -31,6 +31,8 @@ def supervise(
     harness_factory=None,
     reexec=None,
     sync_runner=None,
+    config_path: Path | None = None,
+    join_timeout: float = 5.0,
 ) -> None:
     """Run until stop is set, or until SIGINT/SIGTERM when stop is omitted.
 
@@ -42,6 +44,7 @@ def supervise(
     owns_stop = stop is None
     if stop is None:
         stop = threading.Event()
+    resolved_config = Path(config_path).resolve() if config_path is not None else config.root / "config.toml"
     trigger = config.root / "data" / "restart.request"
     trigger.parent.mkdir(parents=True, exist_ok=True)
     trigger.unlink(missing_ok=True)
@@ -65,7 +68,7 @@ def supervise(
         events=runtime.events,
         decider=runtime.backend.submit_decision,
     )
-    web_thread = threading.Thread(target=server.serve_forever, name="audi28-web")
+    web_thread = threading.Thread(target=server.serve_forever, name="audi28-web", daemon=True)
     transport_thread = threading.Thread(
         target=_run_transport,
         args=(runtime, config, stop, restart),
@@ -82,8 +85,8 @@ def supervise(
     finally:
         stop.set()
         server.shutdown()
-        web_thread.join(timeout=5)
-        transport_thread.join(timeout=8)
+        _join_workers(web_thread, transport_thread, runtime.events, timeout=join_timeout)
+        server.close_listening_socket()
         _clear_supervisor_state(config.root)
         if restart["go"]:
             _reexec_supervisor(
@@ -94,6 +97,7 @@ def supervise(
                 deps_mtime=deps_mtime,
                 reexec=reexec,
                 sync_runner=sync_runner,
+                config_path=resolved_config,
             )
 
 
@@ -280,6 +284,25 @@ def _take_restart(trigger: Path) -> str | None:
     return reason
 
 
+def _join_workers(
+    web_thread: threading.Thread,
+    transport_thread: threading.Thread,
+    events: EventLog,
+    *,
+    timeout: float,
+) -> None:
+    web_thread.join(timeout=timeout)
+    transport_thread.join(timeout=timeout)
+    stuck = [name for name, thread in (("web", web_thread), ("transport", transport_thread)) if thread.is_alive()]
+    if not stuck:
+        return
+    _note_error(events, "重启前线程没有退出：" + "、".join(stuck) + "。监听套接字已经关闭。")
+
+
+def restart_argv(config_path: Path) -> list[str]:
+    return [sys.executable, "-m", "audi28", "--config", str(config_path), "supervise"]
+
+
 def _reexec_supervisor(
     config: Config,
     runtime: _Runtime,
@@ -289,6 +312,7 @@ def _reexec_supervisor(
     deps_mtime: float,
     reexec,
     sync_runner,
+    config_path: Path,
 ) -> None:
     cleaned = _redact_secrets(reason, _secret_values(runtime))[:200]
     os.environ["AUDI28_RESTARTS"] = str(restarts + 1)
@@ -302,25 +326,46 @@ def _reexec_supervisor(
         )
     except Exception:
         pass
-    _sync_dependencies(config, deps_mtime, sync_runner)
+    _sync_dependencies(config, deps_mtime, sync_runner, runtime.events)
+    argv = restart_argv(config_path)
     if reexec is None:
-        os.execv(sys.executable, [sys.executable, *sys.argv])
+        os.execv(argv[0], argv)
         return
-    reexec()
+    reexec(argv)
 
 
-def _sync_dependencies(config: Config, deps_mtime: float, sync_runner) -> None:
-    if _pyproject_mtime(config.root) == deps_mtime:
-        return
-    command = ["uv", "sync", "--extra", "dev"]
+def sync_command(config: Config) -> list[str]:
+    """Match start.sh: plain ``uv sync``, plus the deepseek extra when enabled."""
+
+    command = ["uv", "sync"]
     if config.deepseek.enabled:
         command.extend(["--extra", "deepseek"])
+    return command
+
+
+def _sync_dependencies(config: Config, deps_mtime: float, sync_runner, events: EventLog) -> None:
+    if _pyproject_mtime(config.root) == deps_mtime:
+        return
+    command = sync_command(config)
     if sync_runner is not None:
-        sync_runner(command, config.root)
+        try:
+            sync_runner(command, config.root)
+        except Exception as exc:
+            _note_error(events, f"uv sync 没有跑完：{type(exc).__name__}。")
         return
     if shutil.which("uv") is None:
+        _note_error(events, "找不到 uv，依赖没有同步。")
         return
-    subprocess.run(command, cwd=config.root, check=False)
+    completed = subprocess.run(command, cwd=config.root, check=False)
+    if completed.returncode != 0:
+        _note_error(events, f"uv sync 失败，退出码 {completed.returncode}。")
+
+
+def _note_error(events: EventLog, reason: str) -> None:
+    try:
+        events.append(type="error", source="supervisor", ref=None, data={"reason": reason})
+    except Exception:
+        return
 
 
 def _pyproject_mtime(root: Path) -> float:

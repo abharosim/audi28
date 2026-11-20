@@ -35,7 +35,7 @@ uv run audi28 doctor
 ./start.sh
 ```
 
-改完代码后，在项目里执行 `touch data/restart.request`，supervisor 会自己停掉再拉起来，不用在原来的终端按 Ctrl+C。`pyproject.toml` 有变化时，它会先跑 `uv sync`。
+改完代码后，在项目里执行 `touch data/restart.request`，supervisor 会自己停掉再拉起来，不用在原来的终端按 Ctrl+C。`pyproject.toml` 有变化时，它会先跑 `uv sync`；`[deepseek] enabled = true` 时加上 `--extra deepseek`。找不到 `uv` 或 sync 失败会记一条 error 事件，服务仍会重新拉起。
 
 `doctor` 每一项打 `PASS`、`INFO`、`WARN` 或 `FAIL`。`INFO` 只是说明，没有修法，也不让退出码变成非 0。有 `FAIL` 时退出码不是 0，并给一行可以直接复制的修法。它只说密钥有没有设置、长度是多少，不打印值。`audi28 doctor --json` 打同样的结果。沙箱默认关闭时，这一项是 `INFO`。
 

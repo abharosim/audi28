@@ -68,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         return _sessions_command(config, args.sessions_command, getattr(args, "session_id", None))
     if args.command == "approvals":
         return _approvals_command(config, args)
-    supervise(config)
+    supervise(config, config_path=config_path)
     return 0
 
 

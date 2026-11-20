@@ -107,7 +107,7 @@ flowchart TB
 
 进程模型与 audi27 相同：`./start.sh` → `audi28 supervise` 拉起少量常驻子进程（核心 loop、inbox、web）。DeepSeek 运行时活在核心 loop 里，不要每个任务重新拉起一次 `dsh`。
 
-supervisor 监视 `data/restart.request`。文件出现后，先干净停下仪表盘和传输循环，记下一条 `supervisor` 事件（`action` 为 `restart`，`reason` 是文件内容，最多 200 字，密钥会打码）。若 `pyproject.toml` 比这次启动时新，就在项目根目录执行 `uv sync --extra dev`，DeepSeek 开着时再加 `--extra deepseek`。然后用当前解释器和原来的参数重新执行自己。更新代码时写这个文件即可，不用在终端里按 Ctrl+C。进程刚启动时如果文件已经在，删掉它，这次启动不当成新的重启请求。次数放在 `AUDI28_RESTARTS`，原因放在 `AUDI28_RESTART_REASON`，并写进 `data/supervisor.json` 的 `restarts` 和 `last_reason`。
+supervisor 监视 `data/restart.request`。文件出现后，先干净停下仪表盘和传输循环，记下一条 `supervisor` 事件（`action` 为 `restart`，`reason` 是文件内容，最多 200 字，密钥会打码）。web 和 transport 线程各等一小段时间。没退出的记一条 `error`，监听套接字照样关掉，然后才重新执行。若 `pyproject.toml` 比这次启动时新，就在项目根目录执行 `uv sync`。`[deepseek] enabled = true` 时加上 `--extra deepseek`，不另加 `--extra dev`。找不到 `uv`，或 `uv sync` 退出码不是 0，记一条 `error`，然后仍然重新执行。重新执行的参数是当前解释器加 `-m audi28 --config <配置文件> supervise`。更新代码时写这个文件即可，不用在终端里按 Ctrl+C。进程刚启动时如果文件已经在，删掉它，这次启动不当成新的重启请求。次数放在 `AUDI28_RESTARTS`，原因放在 `AUDI28_RESTART_REASON`，并写进 `data/supervisor.json` 的 `restarts` 和 `last_reason`。
 
 ## 6. 组件
 
