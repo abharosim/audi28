@@ -9,6 +9,19 @@ from audi28.sessions import SessionStore
 from audi28.web import WebServer
 
 
+def _request_no_redirect(port: int, path: str):
+    class _Stop(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+    opener = urllib.request.build_opener(_Stop)
+    try:
+        with opener.open(f"http://127.0.0.1:{port}{path}", timeout=1) as response:
+            return response.status, response.read().decode("utf-8"), response.headers
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8"), exc.headers
+
+
 def _request(port: int, path: str, *, token: str = "", method: str = "GET", payload: dict | None = None, headers: dict | None = None):
     request_headers = dict(headers or {})
     if token:
@@ -77,6 +90,11 @@ def test_dashboard_requires_token_and_uses_the_decision_path(tmp_path):
         page, html, _headers = _request(server.port, "/", token="dash-token")
         assert page == 200
         assert "待审批" in html
+        status, _body, headers = _request_no_redirect(server.port, "/?token=dash-token")
+        assert status == 302
+        assert headers["Location"] == "/"
+        assert "dash-token" not in headers["Location"]
+        assert "audi28_token=dash-token" in headers["Set-Cookie"]
         state_code, raw, _headers = _request(server.port, "/api/state", token="dash-token")
         assert state_code == 200
         state = json.loads(raw)

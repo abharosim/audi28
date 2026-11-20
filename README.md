@@ -12,17 +12,49 @@ audi28 是独立项目，放在 `~/Code/audi28`，和 `~/Code/audi27` 并列。�
 
 ## 现状
 
-仓库里已经有骨架、传输、规则路由、session 存储、DeepSeek adapter，以及审批中心和本机仪表盘。CLI 有 `events`、`supervise`、`web`、`doctor`、`grokbot test`、`sessions list`、`sessions close`、`approvals list`、`approvals decide`。`start.sh` 在 `[deepseek] enabled = true` 时会加上 `--extra deepseek`。没有 `DEEPSEEK_API_KEY` 时不会连接 DeepSeek，也不会崩溃。没有说要新任务时，继续最近一个仍开放的 session。`不是新任务` 和 `接着上一个` 不会另开 session。仪表盘除 `/health` 外需要 `AUDI28_DASHBOARD_TOKEN`。
+仓库里已经有骨架、传输、规则路由、session 存储、DeepSeek adapter、审批中心、本机仪表盘，以及 `audi28 doctor`。CLI 还有 `events`、`supervise`、`web`、`grokbot test`、`sessions list`、`sessions close`、`approvals list`、`approvals decide`。`start.sh` 在 `[deepseek] enabled = true` 时会加上 `--extra deepseek`。没有 `DEEPSEEK_API_KEY` 时不会连接 DeepSeek，也不会崩溃。没有说要新任务时，继续最近一个仍开放的 session。`不是新任务` 和 `接着上一个` 不会另开 session。仪表盘除 `/health` 外需要 `AUDI28_DASHBOARD_TOKEN`。
+
+## 第一次跑
 
 ```bash
-uv sync --extra dev
+uv sync --extra dev --extra deepseek
 cp config.example.toml config.toml
-# .env 里以后放 AUDI28_GROKBOT_WEBHOOK_URL、AUDI28_GROKBOT_WEBHOOK_KEY、DEEPSEEK_API_KEY
-# 密钥还没提供也可以。doctor 会说明怎么补，不会崩溃。
-uv run pytest
+```
+
+在项目根目录建 `.env`（这个文件已在 `.gitignore` 里，不要提交）。四个变量是：
+
+```bash
+DEEPSEEK_API_KEY=sk-...
+AUDI28_GROKBOT_WEBHOOK_URL=https://...
+AUDI28_GROKBOT_WEBHOOK_KEY=...
+AUDI28_DASHBOARD_TOKEN=...
+```
+
+```bash
 uv run audi28 doctor
 ./start.sh
-# 仪表盘：http://127.0.0.1:8728/?token=$AUDI28_DASHBOARD_TOKEN
+```
+
+`doctor` 每一项打 `PASS`、`WARN` 或 `FAIL`。有 `FAIL` 时退出码不是 0，并给一行可以直接复制的修法。它只说密钥有没有设置、长度是多少，不打印值。`audi28 doctor --json` 打同样的结果。
+
+浏览器打开 `http://127.0.0.1:8728/?token=你的token`。登录成功后会跳回不带 token 的地址，之后靠 cookie。
+
+给 DeepSeek 发一条测试任务，把 JSON 写进 `data/inbox/audi/`（文件名随意，比如 `msg-01.json`）：
+
+```json
+{
+  "kind": "task",
+  "message_id": "msg-01",
+  "session_id": null,
+  "target": null,
+  "text": "在仓库里跑测试。"
+}
+```
+
+没有真实密钥时，可以用进程内的假 DeepSeek 把 inbox、session 和 outbox 跑通。它不访问网络：
+
+```bash
+uv run python scripts/mock_deepseek.py
 ```
 
 传输：Audi 不能访问本机 HTTP。任务和审批决定写成 `data/inbox/audi/*.json`。Ruoran 已批准 Audi 把 JSON 写入 `~/Code/audi28/data/inbox/audi/`（目录不存在可以建），其它 Mac 写入仍要单独批准。同一 `message_id` 只处理一次。坏 JSON、symlink 和超过 1MB 的文件会进 `quarantine/`。audi28 把要发给 Audi 的 JSON 先写入 `data/outbox/grokbot/`，再 POST 到 `AUDI28_GROKBOT_WEBHOOK_URL`。失败会留下，重启后续发。`uv run audi28 grokbot test` 发一条测试消息。CI 只用本机假 HTTP server。

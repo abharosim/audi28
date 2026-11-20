@@ -173,6 +173,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", body, cookie=True)
             return
         if path == "/":
+            if parse_qs(parsed.query).get("token"):
+                self._redirect("/")
+                return
             self._send(200, "text/html; charset=utf-8", _PAGE.encode("utf-8"), cookie=True)
             return
         self._send(404, "text/plain; charset=utf-8", b"not found\n")
@@ -228,6 +231,18 @@ class _Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: object) -> None:
         return
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        token = getattr(self.server, "token", "")
+        if token and _cookie_safe(token):
+            self.send_header(
+                "Set-Cookie",
+                f"audi28_token={token}; HttpOnly; SameSite=Strict; Path=/",
+            )
+        self.end_headers()
 
     def _authorized(self, query: str) -> bool:
         expected = getattr(self.server, "token", "")
