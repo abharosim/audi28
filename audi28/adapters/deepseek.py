@@ -62,6 +62,7 @@ class DeepSeekBackend:
         self.sessions = sessions
         self._factory = harness_factory or _real_harness
         self._harness: Any = None
+        self._harness_lock = threading.Lock()
         self._sessions: dict[str, Any] = {}
         self._queues: dict[str, queue.Queue] = {}
         self._workers: dict[str, threading.Thread] = {}
@@ -117,9 +118,18 @@ class DeepSeekBackend:
         self._stop.set()
         for waiter in list(self._waiters.values()):
             waiter.event.set()
-        harness = self._harness
-        if harness is not None and hasattr(harness, "close"):
-            harness.close()
+        for jobs in list(self._queues.values()):
+            jobs.put(None)
+        try:
+            harness = self._harness
+            if harness is not None and hasattr(harness, "close"):
+                harness.close()
+        finally:
+            for worker in list(self._workers.values()):
+                worker.join(timeout=1)
+            pump = self._pump
+            if pump is not None:
+                pump.join(timeout=1)
 
     def _require_key(self, ref: str) -> None:
         if self.api_key:
@@ -135,25 +145,26 @@ class DeepSeekBackend:
         )
 
     def _open_harness(self) -> Any:
-        if self._harness is not None:
-            return self._harness
-        self.workspace.mkdir(parents=True, exist_ok=True)
-        self.dsh_home.mkdir(parents=True, exist_ok=True)
-        harness = self._factory(
-            cwd=str(self.workspace),
-            dsh_home=str(self.dsh_home),
-            api_key=self.api_key,
-            provider=self.provider,
-            model=self.model,
-            profile=self.profile,
-            approval_requests=True,
-            initialize_timeout_seconds=self.initialize_timeout_seconds,
-            on_user_question=self._on_user_question,
-            permission_mode=self.permission_mode,
-        )
-        self._harness = harness
-        self._start_pump(harness)
-        return harness
+        with self._harness_lock:
+            if self._harness is not None:
+                return self._harness
+            self.workspace.mkdir(parents=True, exist_ok=True)
+            self.dsh_home.mkdir(parents=True, exist_ok=True)
+            harness = self._factory(
+                cwd=str(self.workspace),
+                dsh_home=str(self.dsh_home),
+                api_key=self.api_key,
+                provider=self.provider,
+                model=self.model,
+                profile=self.profile,
+                approval_requests=True,
+                initialize_timeout_seconds=self.initialize_timeout_seconds,
+                on_user_question=self._on_user_question,
+                permission_mode=self.permission_mode,
+            )
+            self._harness = harness
+            self._start_pump(harness)
+            return harness
 
     def _start_pump(self, harness: Any) -> None:
         client = getattr(harness, "client", harness)
@@ -220,9 +231,18 @@ class DeepSeekBackend:
                     )
                     continue
                 self._sessions[handle] = session
-            self._apply_permission(session)
-            self._say(audi_session_id, progress, kind="progress")
-            result = session.run(text)
+            try:
+                self._apply_permission(session)
+                self._say(audi_session_id, progress, kind="progress")
+                result = session.run(text)
+            except Exception as exc:
+                self._report(
+                    "error",
+                    audi_session_id,
+                    f"DeepSeek 这一轮失败了。{exc.__class__.__name__}",
+                    "DeepSeek 这一轮没做完。",
+                )
+                continue
             self._say(audi_session_id, _final_text(result), kind="result")
 
     def _apply_permission(self, session: Any) -> None:
@@ -255,7 +275,12 @@ class DeepSeekBackend:
         self._ask("approval", record.id, _approval_text(tool, command, reason), _approval_spoken(tool))
         waiter = _Waiter(threading.Event())
         self._waiters[record.id] = waiter
-        waiter.event.wait()
+        while not waiter.event.wait(timeout=0.2):
+            if self._stop.is_set():
+                break
+        if self._stop.is_set() and waiter.decision is None:
+            client.respond(request.id, {"outcome": "cancelled"})
+            return
         outcome = _approval_outcome(waiter.decision)
         client.respond(request.id, {"outcome": outcome})
 
@@ -279,11 +304,11 @@ class DeepSeekBackend:
         waiter = _Waiter(threading.Event())
         self._waiters[record.id] = waiter
         while not waiter.event.wait(timeout=0.2):
-            if cancelled.is_set():
+            if cancelled.is_set() or self._stop.is_set():
                 return {"cancelled": True}
         if waiter.decision in {None, "deny", "cancel"}:
             return {"cancelled": True}
-        return {"answers": waiter.answers or []}
+        return {"answers": _normalize_answers(waiter.answers)}
 
     def _ask(self, kind: str, request_id: str, text: str, spoken: str) -> None:
         self.outbox.enqueue(
@@ -350,6 +375,26 @@ def _real_harness(**options: Any) -> Any:
             on_user_question=options["on_user_question"],
         )
     )
+
+
+def _normalize_answers(answers: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in answers or []:
+        if not isinstance(item, dict):
+            continue
+        selected = item.get("selected")
+        if isinstance(selected, str):
+            labels = [selected] if selected.strip() else []
+        elif isinstance(selected, list):
+            labels = [part.strip() for part in selected if isinstance(part, str) and part.strip()]
+        else:
+            labels = []
+        entry: dict[str, Any] = {"id": _text(item.get("id")), "selected": labels}
+        custom = item.get("custom")
+        if isinstance(custom, str) and custom.strip():
+            entry["custom"] = custom
+        normalized.append(entry)
+    return normalized
 
 
 def _approval_outcome(decision: str | None) -> str:

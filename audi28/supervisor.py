@@ -42,7 +42,7 @@ def supervise(config: Config, *, stop: threading.Event | None = None) -> None:
         stop.set()
         server.shutdown()
         web_thread.join(timeout=5)
-        transport_thread.join(timeout=5)
+        transport_thread.join(timeout=8)
 
 
 def _transport_loop(config: Config, stop: threading.Event, harness_factory=None) -> None:
@@ -95,18 +95,21 @@ def _transport_loop(config: Config, stop: threading.Event, harness_factory=None)
         workspace=str(config.deepseek.workspace),
         outbox=outbox,
     )
-    while not stop.is_set():
-        try:
-            for message in _messages_to_dispatch(inbox):
-                dispatcher.handle(message)
-                message_id = message.get("message_id")
-                if isinstance(message_id, str) and message_id.strip():
-                    inbox.complete(message_id.strip())
-            outbox.flush_once()
-        except Exception as exc:
-            # Keep the dashboard up, but do not hide the failure.
-            _record_loop_error(events, exc, secrets=(url, key))
-        stop.wait(config.inbox.poll_s)
+    try:
+        while not stop.is_set():
+            try:
+                for message in _messages_to_dispatch(inbox):
+                    dispatcher.handle(message)
+                    message_id = message.get("message_id")
+                    if isinstance(message_id, str) and message_id.strip():
+                        inbox.complete(message_id.strip())
+                outbox.flush_once()
+            except Exception as exc:
+                # Keep the dashboard up, but do not hide the failure.
+                _record_loop_error(events, exc, secrets=(url, key))
+            stop.wait(config.inbox.poll_s)
+    finally:
+        backend.close()
 
 
 def _messages_to_dispatch(inbox: Inbox) -> list[dict]:

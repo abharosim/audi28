@@ -1,4 +1,5 @@
 import json
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -43,6 +44,8 @@ class FakeSession:
         self.harness.prompts.append((self.id, text))
         if text.startswith("/permission"):
             return FakeResult("")
+        if text == self.harness.fail_text:
+            raise RuntimeError("boom")
         self.harness.user_started.set()
         if self.harness.on_user is not None:
             self.harness.on_user(self.id)
@@ -87,6 +90,9 @@ class FakeHarness:
         self.block_user: threading.Event | None = None
         self.user_started = threading.Event()
         self.on_user = None
+        self.fail_text = ""
+        self.closed = False
+        self.child: subprocess.Popen | None = None
         self.errors: list[tuple] = []
 
     def accept(self, **options):
@@ -117,6 +123,15 @@ class FakeHarness:
         self.errors.append((request_id, code, message))
 
     def close(self) -> None:
+        self.closed = True
+        child = self.child
+        if child is not None and child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=1)
         self._queue_impl.put(None)
 
 
@@ -235,7 +250,7 @@ def test_approval_round_trip_allow_and_deny(tmp_path):
 def test_user_question_round_trip(tmp_path):
     harness = FakeHarness(script="question")
     backend, outbox, _pending, _events = _backend(tmp_path, harness)
-    answers = [{"id": "q1", "selected": ["继续"], "custom": None}]
+    answers = [{"id": "q1", "selected": "继续", "custom": None}]
 
     def work() -> None:
         backend.start("ses-q", "提问")
@@ -253,7 +268,7 @@ def test_user_question_round_trip(tmp_path):
         thread.join(timeout=2)
     finally:
         backend.close()
-    assert harness.question_answers == [{"answers": answers}]
+    assert harness.question_answers == [{"answers": [{"id": "q1", "selected": ["继续"]}]}]
 
 
 def test_missing_key_does_not_call_the_sdk(tmp_path):
@@ -430,11 +445,101 @@ def test_transport_loop_flushes_the_decision_round_trip(tmp_path, monkeypatch):
             if script == "approval":
                 assert harness.responses[-1][1] == {"outcome": outcome}
             else:
-                assert harness.question_answers == [{"answers": answers}]
+                assert harness.question_answers == [{"answers": [{"id": "q1", "selected": ["yes"]}]}]
         finally:
             stop.set()
-            thread.join(timeout=2)
+            thread.join(timeout=5)
+            assert harness.closed
+            assert not thread.is_alive()
             server.close()
+
+
+def test_close_reaps_the_runtime_and_stops_workers(tmp_path):
+    harness = FakeHarness(script="approval")
+    child = subprocess.Popen(["sleep", "30"])
+    harness.child = child
+    backend, outbox, _pending, _events = _backend(tmp_path, harness)
+    try:
+        backend.start("ses-1", "跑测试")
+        _wait_for(lambda: any(message["kind"] == "approval" for message in outbox.messages))
+        workers = list(backend._workers.values())
+        pump = backend._pump
+        assert workers and workers[0].is_alive()
+        assert pump is not None and pump.is_alive()
+        backend.close()
+        assert harness.closed
+        assert child.poll() is not None
+        assert all(not worker.is_alive() for worker in workers)
+        assert not pump.is_alive()
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=1)
+        backend.close()
+
+
+def test_concurrent_workers_share_one_harness(tmp_path):
+    harness = FakeHarness()
+    entered: list[int] = []
+    gate = threading.Event()
+
+    def factory(**options):
+        entered.append(1)
+        if len(entered) == 1:
+            assert gate.wait(timeout=2)
+        return harness.accept(**options)
+
+    events = EventLog(tmp_path / "events")
+    backend = DeepSeekBackend(
+        api_key="sk-test",
+        workspace=tmp_path / "workspace",
+        dsh_home=tmp_path / "dsh-home",
+        permission_mode="workspace-write",
+        provider="deepseek-official",
+        model="deepseek-v4-flash",
+        profile="sdk",
+        initialize_timeout_seconds=30,
+        outbox=RecordingOutbox(),
+        events=events,
+        pending=PendingStore(tmp_path / "approvals"),
+        harness_factory=factory,
+    )
+    try:
+        backend.run("session-a", "一")
+        backend.run("session-b", "二")
+        _wait_for(lambda: len(entered) == 1)
+        deadline = time.time() + 0.3
+        while time.time() < deadline:
+            assert entered == [1]
+            time.sleep(0.02)
+        gate.set()
+        _wait_for(lambda: sorted(harness.resumed) == ["session-a", "session-b"])
+        assert entered == [1]
+        pumps = [thread for thread in threading.enumerate() if thread.name == "audi28-deepseek-approvals"]
+        assert len(pumps) == 1
+    finally:
+        gate.set()
+        backend.close()
+
+
+def test_a_failed_prompt_leaves_the_worker_for_the_next_job(tmp_path):
+    harness = FakeHarness()
+    harness.fail_text = "炸"
+    backend, outbox, _pending, _events = _backend(tmp_path, harness)
+    try:
+        handle = backend.start("ses-1", "炸")
+        worker = backend._workers[handle]
+        _wait_for(lambda: any(message["kind"] == "error" and message["source_label"] == "DeepSeek" for message in outbox.messages))
+        spoken = next(message["spoken"] for message in outbox.messages if message["kind"] == "error")
+        assert spoken == "DeepSeek 这一轮没做完。"
+        assert "/" not in spoken
+        backend.run(handle, "第二次")
+        _wait_for(lambda: any(text == "第二次" for _sid, text in harness.prompts))
+        _wait_for(lambda: any(message["kind"] == "result" for message in outbox.messages))
+        assert backend._workers[handle] is worker
+        assert worker.is_alive()
+    finally:
+        backend.close()
 
 
 def _body(item: dict) -> dict:
