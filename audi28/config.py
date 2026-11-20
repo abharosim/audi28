@@ -270,7 +270,7 @@ def _deepseek(table: Mapping[str, object], root: Path) -> DeepSeekConfig:
         workspace=_workspace(_require_str("deepseek", "workspace", table["workspace"])),
         provider=_require_str("deepseek", "provider", table["provider"]),
         model=_require_str("deepseek", "model", table["model"]),
-        permission_mode=_require_str("deepseek", "permission_mode", table["permission_mode"]),
+        permission_mode=_permission_mode(table["permission_mode"]),
         approval_requests=_require_bool(
             "deepseek",
             "approval_requests",
@@ -291,6 +291,19 @@ def _hooks(table: Mapping[str, object]) -> HooksConfig:
         enabled=_require_bool("hooks", "enabled", table["enabled"]),
         token_env=_require_str("hooks", "token_env", table["token_env"]),
     )
+
+
+_PHASE1_PERMISSION_MODES = {"read-only", "workspace-write"}
+
+
+def _permission_mode(value: object) -> str:
+    mode = _require_str("deepseek", "permission_mode", value)
+    if mode not in _PHASE1_PERMISSION_MODES:
+        raise ConfigError(
+            "deepseek.permission_mode 在 Phase 1 只能是 read-only 或 workspace-write，"
+            "不接受 danger-full-access。"
+        )
+    return mode
 
 
 def _workspace(value: str) -> Path:
