@@ -1,0 +1,64 @@
+# 复制为 config.toml 后再改。不要把密钥写进这个文件。
+# webhook 和 DeepSeek 的密钥放项目根目录的 .env（已 gitignore）：
+#   AUDI28_GROKBOT_WEBHOOK_URL=https://...
+#   AUDI28_GROKBOT_WEBHOOK_KEY=...
+#   DEEPSEEK_API_KEY=sk-...
+#   # 可选：DEEPSEEK_BASE_URL=https://api.deepseek.com
+
+[web]
+host = "127.0.0.1"
+port = 8728
+
+[events]
+# 事件写在 data/events/YYYY-MM-DD.jsonl。这里暂时没有可调项，section 先留着。
+
+# Audi 不能访问本机 HTTP。任务和决定写成 data/inbox/audi/*.json。
+[inbox]
+poll_s = 0.2
+parse_retries = 3
+max_bytes = 1048576          # 超过则隔离，不跟随 symlink
+
+# 把结果和提问推给 Audi 的 webhook。URL 和 key 只来自环境变量。
+[grokbot]
+header_name = "Authorization"
+header_value = "Bearer {key}"
+timeout_s = 10               # POST 超时；仅网络错误重试一次
+# 没有回复文件不算 webhook 超时。Audi 的决定走 inbox，见 [approval] timeout_s。
+
+[route]
+# Phase 1 只用规则。以后 llm = true 时，规则无法判断的再交给本地模型，失败则回退 default。
+llm = false
+default = "deepseek"         # 已经进入 inbox 的消息；self = 请 Audi 自己回答
+# 规则文件可选，实现时提供 routes.example.toml。
+# rules = "routes.toml"
+
+[sessions]
+idle_timeout_s = 86400       # 超过此时长无新消息则标为 idle，不自动关闭
+sticky_s = 21600             # 跟进消息没带 session_id 时，仅在此窗口内黏到唯一一个仍开放的 session
+# 若更希望每次都开新 session，实现时可把 sticky_s 设为 0（待 Ruoran 确认）
+
+[deepseek]
+enabled = true
+profile = "sdk"
+# 必须是绝对路径。SDK 不会使用 ~/.dsh。
+dsh_home = "data/dsh-home"
+# 默认工作区，必须是绝对路径。不要隐式使用 $HOME。实现前由 Ruoran 确认。
+# workspace = "/Users/rowang/Code/audi28/workspace"
+provider = "deepseek-official"
+model = "deepseek-v4-flash"
+permission_mode = "workspace-write"
+approval_requests = true
+# 可选：reasoning_effort = "max"
+# 可选：max_tokens = 49152
+initialize_timeout_seconds = 30
+
+[approval]
+timeout_s = 600              # 与 Claude Code HTTP hook 默认等待一致
+timeout_action = "deny"      # Phase 1：超时拒绝（fail closed）。不要改成 allow。
+# 不对写文件、shell、装包、git、工作区以外路径做自动批准。
+
+# 以后：Claude Code 的 PermissionRequest HTTP hook 会 POST 到本机。
+[hooks]
+enabled = false
+token_env = "AUDI28_HOOK_TOKEN"
+# path = "/approve"
