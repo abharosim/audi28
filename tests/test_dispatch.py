@@ -280,10 +280,11 @@ def test_closed_during_touch_opens_a_new_session(tmp_path):
     )
 
     assert backend.runs == []
-    assert len(backend.starts) == 1
+    assert backend.starts == []
     actions = [event.data.get("action") for event in events.replay() if event.type == "session"]
     assert "continued" not in actions
-    assert "created" in actions
+    assert "created" not in actions
+    assert any(event.type == "error" for event in events.replay())
     assert sessions.get(created.session_id).status == "closed"
 
 

@@ -77,12 +77,14 @@ def test_ci_workflow_runs_pytest():
 def test_start_sh_invokes_supervise():
     text = (ROOT / "start.sh").read_text(encoding="utf-8")
     assert "audi28 supervise" in text
+    assert "--extra deepseek" in text
     assert os.access(ROOT / "start.sh", os.X_OK)
 
 
 def test_start_sh_serves_health(tmp_path):
     port = _free_port()
     path = write_config(tmp_path, port=port)
+    path.write_text(path.read_text(encoding="utf-8").replace("enabled = true", "enabled = false", 1), encoding="utf-8")
     env = os.environ.copy()
     env["HOME"] = str(tmp_path / "home")
     env.pop("DEEPSEEK_API_KEY", None)

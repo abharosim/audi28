@@ -6,7 +6,8 @@ import os
 import signal
 import threading
 
-from audi28.backend import UnconnectedBackend
+from audi28.adapters.deepseek import DeepSeekBackend
+from audi28.approvals import PendingStore
 from audi28.config import Config
 from audi28.dispatch import Dispatcher
 from audi28.events import EventLog
@@ -65,6 +66,19 @@ def _transport_loop(config: Config, stop: threading.Event) -> None:
         timeout_s=config.grokbot.timeout_s,
         secrets=(url, key),
     )
+    backend = DeepSeekBackend(
+        api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+        workspace=config.deepseek.workspace,
+        dsh_home=config.deepseek.dsh_home,
+        permission_mode=config.deepseek.permission_mode,
+        provider=config.deepseek.provider,
+        model=config.deepseek.model,
+        profile=config.deepseek.profile,
+        initialize_timeout_seconds=config.deepseek.initialize_timeout_seconds,
+        outbox=outbox,
+        events=events,
+        pending=PendingStore(config.root / "data" / "approvals"),
+    )
     dispatcher = Dispatcher(
         router=RulesRouter(
             default=config.route.default,
@@ -73,9 +87,10 @@ def _transport_loop(config: Config, stop: threading.Event) -> None:
             self_phrases=config.route.self_phrases,
         ),
         sessions=SessionStore(config.root / "data" / "sessions"),
-        backend=UnconnectedBackend(),
+        backend=backend,
         events=events,
         workspace=str(config.deepseek.workspace),
+        outbox=outbox,
     )
     while not stop.is_set():
         try:

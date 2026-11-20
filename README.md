@@ -12,7 +12,7 @@ audi28 是独立项目，放在 `~/Code/audi28`，和 `~/Code/audi27` 并列。�
 
 ## 现状
 
-仓库里已经有骨架、传输、规则路由和 session 存储。CLI 有 `events`、`supervise`、`web`、`doctor`、`grokbot test`、`sessions list`、`sessions close`。`start.sh` 拉起只监听 `127.0.0.1:8728` 的占位仪表盘，并轮询 inbox、做路由、flush webhook outbox。DeepSeek adapter 和审批中心还没做。没有说要新任务时，继续最近一个仍开放的 session。`不是新任务` 和 `接着上一个` 不会另开 session。
+仓库里已经有骨架、传输、规则路由、session 存储，以及 DeepSeek adapter。CLI 有 `events`、`supervise`、`web`、`doctor`、`grokbot test`、`sessions list`、`sessions close`。`start.sh` 在 `[deepseek] enabled = true` 时会加上 `--extra deepseek`。没有 `DEEPSEEK_API_KEY` 时不会连接 DeepSeek，也不会崩溃。审批中心的仪表盘还没做。没有说要新任务时，继续最近一个仍开放的 session。`不是新任务` 和 `接着上一个` 不会另开 session。
 
 ```bash
 uv sync --extra dev

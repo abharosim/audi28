@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
+class BackendNotConfigured(RuntimeError):
+    """The backend cannot run because a required secret is missing."""
+
+
 class Backend(Protocol):
     def start(self, session_id: str, text: str) -> str:
         """Open a backend session and return its handle."""
