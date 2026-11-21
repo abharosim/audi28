@@ -28,7 +28,7 @@ def _dispatcher(tmp_path):
         sessions=sessions,
         backend=backend,
         events=events,
-        workspace="/tmp/deepseek-workspace",
+        workspace=str(tmp_path / "workspace"),
     )
     return dispatcher, events, sessions, backend
 

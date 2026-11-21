@@ -71,10 +71,11 @@ function cell(text) {
   return el;
 }
 function render(data) {
-  const sessions = table(["标题", "状态", "最后活跃"], (data.sessions || []).map(function (row) {
+  const sessions = table(["标题", "状态", "工作目录", "最后活跃"], (data.sessions || []).map(function (row) {
     const tr = document.createElement("tr");
     tr.appendChild(cell(row.title));
     tr.appendChild(cell(row.status));
+    tr.appendChild(cell(row.workdir));
     tr.appendChild(cell(row.updated_ts));
     return tr;
   }));
@@ -328,6 +329,7 @@ def _state(server: Any) -> dict[str, Any]:
                     "session_id": record.session_id,
                     "title": record.title,
                     "status": record.status,
+                    "workdir": record.workdir or "",
                     "updated_ts": record.updated_ts,
                 }
             )
