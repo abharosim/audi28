@@ -52,6 +52,8 @@ profile = "sdk"
 # 必须显式给出。SDK 不会使用 ~/.dsh。相对路径相对于项目根目录。
 dsh_home = "data/dsh-home"
 # 默认工作区。`~` 在加载时展开成绝对路径。相对路径会报错，不会悄悄改用别的 $HOME 目录。
+# 新 session 的文件在 <workspace>/<YYYY-MM-DD>/<会话目录>/。日期是 created_ts 的 America/New_York 本地日。
+# 运行时的 cwd 仍是这个根目录，这样 workspace-write 盖住每一天的子目录。
 workspace = "~/Code/deepseek-workspace"
 provider = "deepseek-official"
 model = "deepseek-v4-flash"

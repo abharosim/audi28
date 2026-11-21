@@ -489,8 +489,12 @@ def _approvals_check(config: Config) -> Check:
 
 def _sessions_check(config: Config) -> Check:
     records = SessionStore(config.root / "data" / "sessions").list(include_closed=True)
-    count = sum(1 for record in records if record.status in _OPEN)
-    return Check("sessions", "PASS", f"{count} 个仍开放。", "")
+    open_records = [record for record in records if record.status in _OPEN]
+    folders = [record.workdir for record in open_records if record.workdir]
+    detail = f"{len(open_records)} 个仍开放。"
+    if folders:
+        detail = f"{len(open_records)} 个仍开放：{'、'.join(folders)}。"
+    return Check("sessions", "PASS", detail, "")
 
 
 def _last_error_check(config: Config, secrets: list[str]) -> Check:

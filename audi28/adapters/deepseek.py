@@ -3,10 +3,15 @@
 Pinned SDK: deepseek-harness-sdk==0.2.2rc2. That release has no permission_mode
 argument. The workspace is `cwd`. The preset is applied with
 `Session.run("/permission <mode>")` after start_session and resume_session.
+
+`workspace-write` stays bound to that initialize cwd. A session folder is
+applied with `Session.set_working_directory` when the SDK provides it, and
+with a short instruction on the first prompt and again after resume.
 """
 
 from __future__ import annotations
 
+import logging
 import queue
 import re
 import threading
@@ -19,6 +24,9 @@ from typing import Any
 from audi28.approval import ApprovalCenter
 from audi28.backend import BackendNotConfigured
 from audi28.events import EventLog
+from audi28.sessions import session_directory
+
+log = logging.getLogger("audi28.deepseek")
 
 _PATHISH = re.compile(r"(https?://\S+|~?/[\w./~-]+|[A-Za-z]:\\[\w.\\ -]+|sk-[A-Za-z0-9_-]+)")
 
@@ -73,25 +81,33 @@ class DeepSeekBackend:
         self._workers: dict[str, threading.Thread] = {}
         self._worker_guard = threading.Lock()
         self._permitted: set[str] = set()
+        self._introduced: set[str] = set()
         self._waiters: dict[str, _Waiter] = {}
         self._pump: threading.Thread | None = None
         self._stop = threading.Event()
         self.configured = bool(self.api_key)
 
-    def start(self, session_id: str, text: str) -> str:
+    def start(self, session_id: str, text: str, *, workdir: str | None = None) -> str:
         self._require_key(session_id)
         handle = f"session-{uuid.uuid4().hex}"
         session = self._open_harness().start_session(handle)
         self._sessions[handle] = session
         if self.sessions is not None:
             self.sessions.set_handle(session_id, handle)
-        self._submit(handle, session_id, text, "开始处理这条任务。")
+        self._submit(handle, session_id, text, "开始处理这条任务。", workdir)
         return handle
 
-    def run(self, backend_session_id: str, text: str, *, audi_session_id: str | None = None) -> None:
+    def run(
+        self,
+        backend_session_id: str,
+        text: str,
+        *,
+        audi_session_id: str | None = None,
+        workdir: str | None = None,
+    ) -> None:
         audi_id = audi_session_id or backend_session_id
         self._require_key(audi_id)
-        self._submit(backend_session_id, audi_id, text, "继续处理这条任务。")
+        self._submit(backend_session_id, audi_id, text, "继续处理这条任务。", workdir)
 
     def submit_decision(
         self,
@@ -201,10 +217,17 @@ class DeepSeekBackend:
         self._pump = threading.Thread(target=loop, name="audi28-deepseek-approvals", daemon=True)
         self._pump.start()
 
-    def _submit(self, handle: str, audi_session_id: str, text: str, progress: str) -> None:
+    def _submit(
+        self,
+        handle: str,
+        audi_session_id: str,
+        text: str,
+        progress: str,
+        workdir: str | None,
+    ) -> None:
         self._audi_by_backend[handle] = audi_session_id
         jobs = self._queues.setdefault(handle, queue.Queue())
-        jobs.put((audi_session_id, text, progress))
+        jobs.put((audi_session_id, text, progress, workdir))
         with self._worker_guard:
             if handle in self._workers:
                 return
@@ -226,8 +249,9 @@ class DeepSeekBackend:
                 continue
             if item is None:
                 return
-            audi_session_id, text, progress = item
+            audi_session_id, text, progress, workdir = item
             session = self._sessions.get(handle)
+            resumed = False
             if session is None:
                 try:
                     session = self._open_harness().resume_session(handle)
@@ -241,8 +265,10 @@ class DeepSeekBackend:
                     )
                     continue
                 self._sessions[handle] = session
+                resumed = True
             try:
                 self._apply_permission(session)
+                text = self._with_folder(session, handle, text, workdir, resumed=resumed)
                 self._say(audi_session_id, progress, kind="progress", backend_session_id=handle)
                 result = session.run(text)
             except Exception as exc:
@@ -261,6 +287,38 @@ class DeepSeekBackend:
             return
         session.run(f"/permission {self.permission_mode}")
         self._permitted.add(session.id)
+
+    def _with_folder(
+        self,
+        session: Any,
+        handle: str,
+        text: str,
+        workdir: str | None,
+        *,
+        resumed: bool,
+    ) -> str:
+        if not workdir:
+            return text
+        folder = session_directory(self.workspace, workdir)
+        if folder is None:
+            log.warning("会话目录不在工作区里，这一轮不改工作目录。")
+            return text
+        folder.mkdir(parents=True, exist_ok=True)
+        setter = getattr(session, "set_working_directory", None)
+        if callable(setter):
+            try:
+                setter(str(folder))
+            except Exception:
+                log.warning("设置会话工作目录失败，改为只在提示里说明。")
+        if resumed or handle not in self._introduced:
+            self._introduced.add(handle)
+            return (
+                "Working folder for this conversation: "
+                + str(folder)
+                + ". Create and edit files only there unless the user explicitly asks otherwise.\n\n"
+                + text
+            )
+        return text
 
     def _handle_approval(self, client: Any, request: Any) -> None:
         payload = request.payload if isinstance(request.payload, dict) else {}

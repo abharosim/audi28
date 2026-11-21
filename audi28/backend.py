@@ -11,10 +11,17 @@ class BackendNotConfigured(RuntimeError):
 
 
 class Backend(Protocol):
-    def start(self, session_id: str, text: str) -> str:
+    def start(self, session_id: str, text: str, *, workdir: str | None = None) -> str:
         """Open a backend session and return its handle."""
 
-    def run(self, backend_session_id: str, text: str, *, audi_session_id: str | None = None) -> None:
+    def run(
+        self,
+        backend_session_id: str,
+        text: str,
+        *,
+        audi_session_id: str | None = None,
+        workdir: str | None = None,
+    ) -> None:
         """Send a follow-up to an existing backend session."""
 
 
@@ -23,6 +30,7 @@ class StartCall:
     session_id: str
     text: str
     handle: str
+    workdir: str | None = None
 
 
 @dataclass(frozen=True)
@@ -30,6 +38,7 @@ class RunCall:
     backend_session_id: str
     text: str
     audi_session_id: str | None = None
+    workdir: str | None = None
 
 
 class FakeBackend:
@@ -39,17 +48,25 @@ class FakeBackend:
         self.starts: list[StartCall] = []
         self.runs: list[RunCall] = []
 
-    def start(self, session_id: str, text: str) -> str:
+    def start(self, session_id: str, text: str, *, workdir: str | None = None) -> str:
         handle = f"fake-{len(self.starts) + 1}"
-        self.starts.append(StartCall(session_id=session_id, text=text, handle=handle))
+        self.starts.append(StartCall(session_id=session_id, text=text, handle=handle, workdir=workdir))
         return handle
 
-    def run(self, backend_session_id: str, text: str, *, audi_session_id: str | None = None) -> None:
+    def run(
+        self,
+        backend_session_id: str,
+        text: str,
+        *,
+        audi_session_id: str | None = None,
+        workdir: str | None = None,
+    ) -> None:
         self.runs.append(
             RunCall(
                 backend_session_id=backend_session_id,
                 text=text,
                 audi_session_id=audi_session_id,
+                workdir=workdir,
             )
         )
 
@@ -57,10 +74,17 @@ class FakeBackend:
 class UnconnectedBackend:
     """Used until the DeepSeek adapter is installed. It does not open a network session."""
 
-    def start(self, session_id: str, text: str) -> str:
-        del session_id, text
+    def start(self, session_id: str, text: str, *, workdir: str | None = None) -> str:
+        del session_id, text, workdir
         return ""
 
-    def run(self, backend_session_id: str, text: str, *, audi_session_id: str | None = None) -> None:
-        del backend_session_id, text, audi_session_id
+    def run(
+        self,
+        backend_session_id: str,
+        text: str,
+        *,
+        audi_session_id: str | None = None,
+        workdir: str | None = None,
+    ) -> None:
+        del backend_session_id, text, audi_session_id, workdir
         return None

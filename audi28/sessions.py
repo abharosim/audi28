@@ -12,10 +12,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 _CONTINUABLE = {"open", "idle", "running"}
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
 _THREAD_GUARD = threading.Lock()
+_NEW_YORK = ZoneInfo("America/New_York")
+_SLUG_MAX = 32
 
 
 class SessionNotFound(LookupError):
@@ -34,9 +37,10 @@ class Session:
     pending_questions: int
     workspace: str
     last_task_id: str | None
+    workdir: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "session_id": self.session_id,
             "backend": self.backend,
             "backend_session_id": self.backend_session_id,
@@ -48,6 +52,9 @@ class Session:
             "workspace": self.workspace,
             "last_task_id": self.last_task_id,
         }
+        if self.workdir:
+            payload["workdir"] = self.workdir
+        return payload
 
 
 class SessionStore:
@@ -63,22 +70,33 @@ class SessionStore:
         backend_session_id: str,
         workspace: str,
         task_id: str | None,
+        workdir: str | None = None,
+        allocate_in: Path | None = None,
     ) -> Session:
         self.directory.mkdir(parents=True, exist_ok=True)
-        now = self._timestamp()
-        record = Session(
-            session_id=f"ses-{uuid.uuid4().hex}",
-            backend=backend,
-            backend_session_id=backend_session_id,
-            status="open",
-            title=_title(title),
-            created_ts=now,
-            updated_ts=now,
-            pending_questions=0,
-            workspace=workspace,
-            last_task_id=task_id,
-        )
         with self._guard():
+            now = self._timestamp()
+            chosen = workdir.strip() if isinstance(workdir, str) and workdir.strip() else None
+            if chosen is None and allocate_in is not None:
+                chosen = choose_workdir(
+                    Path(allocate_in),
+                    title,
+                    datetime.fromisoformat(now),
+                    reserved=_reserved_workdirs(self.directory),
+                )
+            record = Session(
+                session_id=f"ses-{uuid.uuid4().hex}",
+                backend=backend,
+                backend_session_id=backend_session_id,
+                status="open",
+                title=_title(title),
+                created_ts=now,
+                updated_ts=now,
+                pending_questions=0,
+                workspace=workspace,
+                last_task_id=task_id,
+                workdir=chosen,
+            )
             _atomic_json(self._path(record.session_id), record.as_dict())
         return record
 
@@ -235,7 +253,115 @@ def _session_from_obj(obj: object) -> Session:
         pending_questions=int(obj.get("pending_questions") or 0),
         workspace=str(obj.get("workspace") or ""),
         last_task_id=obj.get("last_task_id") if isinstance(obj.get("last_task_id"), str) else None,
+        workdir=_optional_text(obj.get("workdir")),
     )
+
+
+def task_slug(text: str, when: datetime) -> str:
+    """Short ASCII folder name. Chinese-only text becomes ``task-HHMM`` in New York."""
+
+    pieces: list[str] = []
+    for char in text.casefold():
+        if "a" <= char <= "z" or "0" <= char <= "9":
+            pieces.append(char)
+        else:
+            pieces.append("-")
+    slug = "".join(pieces)
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    slug = slug.strip("-")
+    if len(slug) > _SLUG_MAX:
+        slug = slug[:_SLUG_MAX].rstrip("-")
+    if slug:
+        return slug
+    return f"task-{_new_york(when).strftime('%H%M')}"
+
+
+def choose_workdir(
+    workspace: Path,
+    text: str,
+    when: datetime,
+    *,
+    reserved: set[str] | None = None,
+) -> str:
+    """Create ``<workspace>/<YYYY-MM-DD>/<slug>`` and return the relative path.
+
+    The date and ``task-HHMM`` clock are America/New_York. A name already on
+    disk, or already stored on a session, gets ``-2``, ``-3``, and so on.
+    """
+
+    local = _new_york(when)
+    day = local.strftime("%Y-%m-%d")
+    slug = task_slug(text, when)
+    taken = reserved or set()
+    date_dir = Path(workspace) / day
+    index = 1
+    while index < 10000:
+        name = slug if index == 1 else f"{slug}-{index}"
+        relative = f"{day}/{name}"
+        path = date_dir / name
+        if relative in taken or path.is_symlink() or path.exists():
+            index += 1
+            continue
+        try:
+            path.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            index += 1
+            continue
+        return relative
+    raise RuntimeError("没有可用的会话目录名。")
+
+
+def session_directory(workspace: Path, workdir: str) -> Path | None:
+    """Absolute session folder, or None when it would leave the workspace."""
+
+    raw = workdir.strip()
+    if not raw:
+        return None
+    root = Path(workspace).resolve()
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        try:
+            relative = candidate.resolve().relative_to(root)
+        except ValueError:
+            return None
+    else:
+        relative = candidate
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        return None
+    resolved = (root / relative).resolve()
+    if resolved == root or root not in resolved.parents:
+        return None
+    return resolved
+
+
+def _new_york(when: datetime) -> datetime:
+    if when.tzinfo is None or when.utcoffset() is None:
+        raise ValueError("session 时间必须带时区。")
+    return when.astimezone(_NEW_YORK)
+
+
+def _optional_text(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _reserved_workdirs(directory: Path) -> set[str]:
+    taken: set[str] = set()
+    if not directory.exists():
+        return taken
+    for path in directory.glob("ses-*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        workdir = _optional_text(payload.get("workdir"))
+        if workdir:
+            taken.add(workdir)
+    return taken
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:

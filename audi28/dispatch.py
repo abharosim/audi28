@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from audi28.backend import Backend, BackendNotConfigured
 from audi28.events import EventLog
 from audi28.router import RouteContext, Router, SessionSnapshot, TaskMessage
-from audi28.sessions import Session, SessionNotFound, SessionStore
+from audi28.sessions import Session, SessionNotFound, SessionStore, session_directory
+
+log = logging.getLogger("audi28.dispatch")
 
 _REJECTED = {"closed", "error"}
 
@@ -103,10 +107,11 @@ class Dispatcher:
             backend_session_id="",
             workspace=self.workspace,
             task_id=task.message_id,
+            allocate_in=self._workspace_path(),
         )
         self._session_event("created", record, reason)
         try:
-            handle = self.backend.start(record.session_id, task.text)
+            handle = self.backend.start(record.session_id, task.text, workdir=self._folder(record))
         except BackendNotConfigured as exc:
             self._not_configured(task.message_id, str(exc))
             return
@@ -144,6 +149,7 @@ class Dispatcher:
                 record.backend_session_id,
                 task.text,
                 audi_session_id=record.session_id,
+                workdir=self._folder(record),
             )
         except BackendNotConfigured as exc:
             self._not_configured(task.message_id, str(exc))
@@ -219,20 +225,45 @@ class Dispatcher:
             return
         self._session_event("closed", record, "关闭 session")
 
+    def _workspace_path(self) -> Path | None:
+        raw = self.workspace.strip()
+        if not raw:
+            return None
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            return None
+        return path
+
+    def _folder(self, record: Session) -> str | None:
+        root = self._workspace_path()
+        if root is None:
+            return None
+        if not record.workdir:
+            log.warning("session %s 没有 workdir，这一轮用工作区根目录，不移动已有文件。", record.session_id)
+            return None
+        folder = session_directory(root, record.workdir)
+        if folder is None:
+            log.warning("session %s 的 workdir 不可用，这一轮用工作区根目录，不移动已有文件。", record.session_id)
+            return None
+        return str(folder)
+
     def _session_event(self, action: str, record: Session, reason: str) -> None:
+        data = {
+            "action": action,
+            "session_id": record.session_id,
+            "status": record.status,
+            "backend_session_id": record.backend_session_id,
+            "title": record.title,
+            "pending_questions": record.pending_questions,
+            "reason": reason,
+        }
+        if record.workdir:
+            data["workdir"] = record.workdir
         self.events.append(
             type="session",
             source="sessions",
             ref=record.session_id,
-            data={
-                "action": action,
-                "session_id": record.session_id,
-                "status": record.status,
-                "backend_session_id": record.backend_session_id,
-                "title": record.title,
-                "pending_questions": record.pending_questions,
-                "reason": reason,
-            },
+            data=data,
         )
 
 

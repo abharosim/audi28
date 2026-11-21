@@ -76,6 +76,18 @@ Phase 1 用完整 `sdk` profile（需要权限预设），`dsh_home` 放在项�
 
 默认 workspace 是 `~/Code/deepseek-workspace`，写在 `config.toml` 的 `[deepseek] workspace`，可以改成另一个目录。加载配置时把 `~` 展开成绝对路径。没写 workspace，或写成相对路径，都是配置错误，不会悄悄改用 `$HOME` 下的别的目录。`workspace-write` 只划定 DeepSeek 能碰到的目录；每一次工具调用仍然进入审批中心。
 
+工作区按会话分目录，不把所有任务的文件堆在根上：
+
+```
+<workspace>/<YYYY-MM-DD>/<session-folder>/
+```
+
+外层日期是这条 session 的 `created_ts` 换到 America/New_York 之后的本地日期。里面每个会话一个目录，这个会话的文件都放这里。router 决定新开 session 之后，session 层选定目录、`mkdir -p`，并把相对路径写进 session 记录的 `workdir`（例如 `2026-11-21/visa-monitor`）。目录名是任务正文的短 ASCII slug：小写，只留 `a-z`、`0-9` 和 `-`，其它字符当成分隔符，最长 32 个字符，去掉首尾的 `-`。正文里没有可用的 ASCII（例如只有中文）时用 `task-<HHMM>`，`HHMM` 同样是 America/New_York 的 24 小时时间。同一天里名字撞了就加 `-2`、`-3`。撞名看磁盘上已有的目录，也看已有 session 记录里的 `workdir`（目录被删掉也不复用，避免两个会话以后写进同一个文件夹）。继续同一个 session 时，哪怕过了几天，仍然用原来的 `workdir`，不按当天再开一个。
+
+没有 `workdir` 的旧 session 不搬文件。下一次任务落到工作区根目录，并记一条警告。
+
+DeepSeek 运行时的 initialize `cwd` 仍然是工作区根。SDK 0.2.2rc2 的 `workspace-write` 绑在这个 cwd 上，`set_working_directory` 不改变权限范围，所以根目录才能盖住每一天的子目录。每个会话如果 SDK 的 `Session` 提供 `set_working_directory`，audi28 会在跑用户提示之前把它指到该会话的绝对路径。新会话的第一条用户提示，以及进程重启后 `resume_session` 的那一条，前面会加一句短说明：这次对话的工作目录是这个绝对路径，除非用户明确要求，否则只在这里创建和修改文件。同一进程里后面的跟进不再重复这句。SDK 没有这个方法，或调用失败时，只靠这句说明。这句说明只进给 DeepSeek 的提示，不进 `spoken_text`。
+
 ## 5. 架构
 
 ```mermaid
@@ -180,9 +192,9 @@ supervisor 的传输循环碰到异常时记一条 `error`（不写进密钥和 
 
 - audi28 自己生成 `session_id`（例如 `ses-<uuid>`），不要直接拿 DeepSeek 的 id 当对外 id，方便以后一个会话模型下挂多个 backend。
 - 映射表持久化在 `data/sessions/<session_id>.json`，并写 `session` 事件。`session` 事件带上路由决定里的 `reason`。命令行 `sessions close` 也写一条。重启后以文件为准，事件可重建。`close`、`touch`、`set_handle` 在同一把排他锁里读改写（线程锁再加 `fcntl`），避免后写入的旧状态把已关闭的 session 重新打开，或丢掉 `last_task_id`。
-- 每条记录至少包含：`session_id`、`backend`（Phase 1 只有 `deepseek`）、`backend_session_id`（backend 的 session handle）、`workspace`、`status`（`open` / `idle` / `running` / `closed` / `error`）、`created_ts`、`updated_ts`（最后活跃时间）、`pending_questions`（还没回答的提问数，Phase 1 先记着，审批中心以后来改）、`last_task_id`、`title`（可从首条任务截断）。
+- 每条记录至少包含：`session_id`、`backend`（Phase 1 只有 `deepseek`）、`backend_session_id`（backend 的 session handle）、`workspace`、`status`（`open` / `idle` / `running` / `closed` / `error`）、`created_ts`、`updated_ts`（最后活跃时间）、`pending_questions`（还没回答的提问数，Phase 1 先记着，审批中心以后来改）、`last_task_id`、`title`（可从首条任务截断）。新 session 还有可选的 `workdir`：相对 workspace 的会话目录，例如 `2026-11-21/visa-monitor`。旧文件没有这个字段。布局见第 4 节。
 - 开新 session 还是继续上一个，由 router 决定，见第 9 节。决定成新 session 之后，调用 `harness.run(..., session_id=backend_session_id)`。把两个 id 都写进发给 Audi 的结果。Audi 可以在后续消息里带回 `session_id`；没带回、也没明确要新任务时，仍然继续最近一个仍开放的 session。
-- 同一 session 的跟进：若 DeepSeek 运行时还在，直接 `session.run(text)`；若进程刚重启，先 `resume_session(backend_session_id)` 再 `run`。`dsh_home` 和 workspace 必须与创建时相同。
+- 同一 session 的跟进：若 DeepSeek 运行时还在，直接 `session.run(text)`；若进程刚重启，先 `resume_session(backend_session_id)` 再 `run`。`dsh_home` 和 workspace 必须与创建时相同。跟进沿用原来的 `workdir`，不因为换了日期而换目录。没有 `workdir` 的记录继续用 workspace 根，不自动搬家。
 - 多个 session 可以并存。推荐一个长期存活的 `DeepSeekHarness`。官方说明 `run()` 可以重叠且不会互相吃掉结果；Phase 1 仍按 session **串行** 执行（每个 session 一个队列），避免审批和提问交错难理。不同 session 之间可以并行，若实现成本高，MVP 先全局串行也行，在代码里留出队列边界。
 - 关闭：用户或 Audi 发 `kind: close_session`。audi28 把状态标为 `closed`，不再接受新输入。协议没有 session-close RPC，关闭时不必杀掉整个运行时（以免牵连其它 session）。放弃一轮进行中的 turn，官方做法是关掉运行时进程——Phase 1 只支持「取消待审批」（回 `cancelled` / `{cancelled:true}`），不保证能中止已经在跑的工具。这一点要在 `doctor` 和文档里写清楚。
 - 过期：`[sessions] idle_timeout_s`（建议默认 24 小时无新消息则标 `idle`，不自动关闭，避免误杀）。`closed` 的不再 resume。列出时默认隐藏已关闭的。
@@ -456,7 +468,7 @@ webhook 体（audi28 → Audi）：
 - 仪表盘和以后的 hook HTTP 只绑 `127.0.0.1`，不绑 `0.0.0.0`。
 - webhook 和（以后）hook 端点使用 token。Token 只来自环境变量 / `.env`。Claude Code 的 hook header 用 `allowedEnvVars`，不要把 token 写进仓库里的 `settings.json`。
 - Phase 1 不对写文件、shell、插件安装、git、工作区以外的路径做 auto-approve。
-- 默认权限预设是 `workspace-write`。加载时只接受 `read-only` 和 `workspace-write`，拒绝 `danger-full-access`。工具调用仍要经过审批。workspace 默认是 `~/Code/deepseek-workspace`，写在 `config.toml` 里；加载时把 `~` 展开成绝对路径。没写、或写成相对路径，都是配置错误，不会悄悄改用 `$HOME` 下的另一个目录。
+- 默认权限预设是 `workspace-write`。加载时只接受 `read-only` 和 `workspace-write`，拒绝 `danger-full-access`。工具调用仍要经过审批。workspace 默认是 `~/Code/deepseek-workspace`，写在 `config.toml` 里；加载时把 `~` 展开成绝对路径。没写、或写成相对路径，都是配置错误，不会悄悄改用 `$HOME` 下的另一个目录。会话文件在 `<workspace>/<YYYY-MM-DD>/<session-folder>/`。运行时 cwd 仍是 workspace 根，权限范围才盖得住这些子目录。见第 4 节。
 - 日志和事件做 redact（URL、key）。inbox 不跟随 symlink。
 - DeepSeek 的 `dsh_home` 隔离在项目 `data/` 下。macOS 沙箱默认关闭，所有平台都一样：只有 `[deepseek.sandbox] enabled = true` 才用 `sandbox-exec` 套住 `dsh`。打开之后默认允许，拒绝家目录的读写，只放开工作区、`dsh_home`，以及读 `.venv` 和运行时文件。项目 `.env` 不给读，密钥走环境变量。SDK 0.2.2rc2 的入口是 `dsh_bin`，audi28 用一个包装脚本去调用 `sandbox-exec`。没有 `sandbox-exec` 时记 WARN 并继续。`doctor` 在沙箱关闭时打 `INFO`，不打 `WARN`，也不因此非 0 退出。网络和系统目录（包括 `/tmp`）仍可读，这是打开沙箱之后的残留风险。
 - 本机写 API（若仪表盘以后要批准按钮）必须要求 JSON、loopback Host，并拒绝跨站 `Sec-Fetch-Site`（对齐 audi27 的 `/api/confirm`）。
@@ -552,7 +564,7 @@ Phase 1 代码按上面拆模块，但每个 PR 只交能独立验证的一小�
 下面五条已经由 Ruoran 决定，不再是开放问题。未验证的技术风险仍在第 17 节。
 
 1. **Allow rule。** 已批准。Audi 可以把 JSON 写入 `~/Code/audi28/data/inbox/audi/`，目录不存在可以建，不用再问。其它 Mac 写入仍要单独批准。见第 7 节。
-2. **Workspace 与权限。** 默认工作区是 `~/Code` 下的新目录 `~/Code/deepseek-workspace`，可在 `config.toml` 里改。权限预设 `workspace-write`。工具调用仍走审批。见第 4、14 节。
+2. **Workspace 与权限。** 默认工作区是 `~/Code` 下的新目录 `~/Code/deepseek-workspace`，可在 `config.toml` 里改。权限预设 `workspace-write`。工具调用仍走审批。每个新 session 再用 `<workspace>/<YYYY-MM-DD>/<slug>/` 收该会话的文件。见第 4、14 节。
 3. **Session。** 默认继续最近一个仍开放的 session。router 根据上下文判断用户是不是要新任务；只有明确说要新任务（例如「新任务」「开一个新的」「new task」）才另开。决定带 `reason`，写成 `route` 事件。规则优先，以后可以插一个 LLM 判断。见第 9 节。
 4. **密钥。** `DEEPSEEK_API_KEY` 稍后由 Ruoran 提供。从 `~/Code/audi28/.env`（gitignore）或环境变量读取。缺失时 `doctor` 说明补法，进程不崩溃。
 5. **审批超时。** 不自动拒绝。pending 的审批和提问一直等到用户回答。它们挺过重启，会再次提醒，仪表盘上看得到。没有 600 秒拒绝的默认值。见第 10 节。
